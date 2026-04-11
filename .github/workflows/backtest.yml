@@ -1,0 +1,96 @@
+name: Momentum Delivery — Backtest
+
+# -----------------------------------------------------------------------
+# Daily-signal backtest — mirrors the exact live bot logic.
+# Each historical day is scanned: exits are checked first, then entries.
+# No calendar forcing — all exits are signal-driven.
+#
+# Configurable parameters let you tune and compare strategies.
+# Results upload as 3 CSV artifacts.
+# -----------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Start date (YYYY-MM-DD)"
+        required: false
+        default: "2020-01-01"
+      end_date:
+        description: "End date (YYYY-MM-DD)"
+        required: false
+        default: "2024-12-31"
+      portfolio_size:
+        description: "Max open positions (default 15)"
+        required: false
+        default: "15"
+      capital:
+        description: "Initial capital INR (default 1500000)"
+        required: false
+        default: "1500000"
+      hard_stop:
+        description: "Hard stop % e.g. 0.08 = 8% (default 0.08)"
+        required: false
+        default: "0.08"
+      profit_target:
+        description: "Profit target % e.g. 0.18 = 18% (default 0.18)"
+        required: false
+        default: "0.18"
+      composite_floor:
+        description: "Composite exit floor (default 1.5)"
+        required: false
+        default: "1.5"
+      no_regime_filter:
+        description: "Disable regime filter? true/false (default false)"
+        required: false
+        default: "false"
+
+jobs:
+  backtest:
+    name: Run Daily Backtest
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+        working-directory: momentum-rotation-bot
+
+      - name: Run backtest
+        env:
+          STOCKSDEVELOPER_API_KEY: "backtest-mode"
+          STOCKSDEVELOPER_ACCOUNT: "backtest-mode"
+        run: |
+          python backtest.py \
+            --start          "${{ github.event.inputs.start_date   || '2020-01-01' }}" \
+            --end            "${{ github.event.inputs.end_date     || '2024-12-31' }}" \
+            --portfolio-size "${{ github.event.inputs.portfolio_size || '15' }}" \
+            --capital        "${{ github.event.inputs.capital       || '1500000' }}" \
+            --stop           "${{ github.event.inputs.hard_stop     || '0.08' }}" \
+            --target         "${{ github.event.inputs.profit_target || '0.18' }}" \
+            --floor          "${{ github.event.inputs.composite_floor || '1.5' }}" \
+            ${{ github.event.inputs.no_regime_filter == 'true' && '--no-regime-filter' || '' }}
+        working-directory: momentum-rotation-bot
+
+      - name: Upload backtest results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-${{ github.event.inputs.start_date || '2020' }}-${{ github.event.inputs.end_date || '2024' }}-run${{ github.run_id }}
+          path: |
+            momentum-rotation-bot/backtest_results.csv
+            momentum-rotation-bot/backtest_trades.csv
+            momentum-rotation-bot/backtest_performance.csv
+          if-no-files-found: warn
