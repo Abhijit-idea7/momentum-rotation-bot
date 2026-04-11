@@ -1,40 +1,37 @@
 """
 main.py
 -------
-Entry point for the Momentum Delivery Bot — Daily Signal Scan.
-
+Momentum Delivery Bot — Daily Signal Scan.
 Run manually at ~3 PM IST each trading day via GitHub Actions.
 
-Lifecycle each run:
-  1. Download latest daily price history for Nifty 200 universe
-  2. Score and rank every stock using the momentum composite framework
-  3. Load current open positions from positions.csv
-  4. CHECK EXITS — sell any held stock that triggers a signal-driven exit:
-       • Composite score  < 1.5        (momentum fading)
-       • Signal turned SHORT           (direction reversal)
-       • ROC20 < 0 AND price < 50D MA  (trend break — both required)
-       • Position down ≥ 8%            (hard stop-loss)
-       • Position up   ≥ 18%           (profit harvest)
-  5. CHECK ENTRIES — buy any STRONG/MODERATE LONG signal not already held,
-       up to PORTFOLIO_SIZE open positions
-  6. Fire CNC delivery market orders via stocksdeveloper → Zerodha
-  7. Save updated positions.csv and append to trade_log.csv
-  8. GitHub Actions commits both files back to the repo
+Exit rules (signal-driven, evaluated in this order):
+  1. Hard stop    — down ≥ 6% from entry          [always active, even day 1]
+  2. Profit target— up  ≥ 18% from entry          [always active]
+  3. Signal SHORT — direction reversed             [after MIN_HOLD_DAYS]
+  4. Momentum fade— composite < floor              [after MIN_HOLD_DAYS]
+                    floor = 2.5 in bear regime, 1.5 in bull
+  5. Trend break  — ROC20 < 0 AND price < 50D MA  [after MIN_HOLD_DAYS]
 
-Orders fire at ~3 PM IST as MARKET orders (market closes 3:30 PM).
+Entry rules:
+  • STRONG signal only (no MODERATE)
+  • GOOD or OK entry type (not CHASE)
+  • Not already held + slot available + bull regime
+  • Not on re-entry cooldown (15 days after last exit)
 """
 
 import logging
 import sys
-from datetime import datetime
+from datetime import date, datetime
 
 import pytz
 
 from config import (
+    BEAR_COMPOSITE_FLOOR,
     ENTRY_QUALITY_FILTER,
     EXIT_COMPOSITE_FLOOR,
     HARD_STOP_PCT,
     MARKET_REGIME_FILTER,
+    MIN_HOLD_DAYS,
     PORTFOLIO_SIZE,
     POSITION_SIZE_INR,
     PROFIT_TARGET_PCT,
@@ -45,14 +42,12 @@ from order_manager import buy_delivery, calculate_quantity, sell_delivery
 from portfolio_state import DeliveryPosition, PortfolioState
 from trade_logger import log_buy, log_sell, print_session_summary
 
-# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("main")
-
 IST = pytz.timezone("Asia/Kolkata")
 
 
@@ -65,42 +60,47 @@ def ist_now() -> datetime:
 # ---------------------------------------------------------------------------
 
 def check_exit_reason(
-    pos:   DeliveryPosition,
-    score: MomentumScore | None,
+    pos:        DeliveryPosition,
+    score:      MomentumScore | None,
+    bull_regime: bool,
 ) -> str | None:
     """
-    Evaluate one held position against all exit criteria.
-    Returns a reason string if it should be sold, None to keep holding.
+    Evaluate all exit criteria for one held position.
+    Returns a reason string to sell, or None to keep holding.
     """
     if score is None:
         return "DATA_GAP"
 
-    current_price = score.current_price
-    entry_price   = pos.entry_price
+    cur_price   = score.current_price
+    entry_price = pos.entry_price
+    days_held   = (date.today() - date.fromisoformat(pos.entry_date)).days
 
-    # 1. Hard stop-loss
-    loss_pct = (entry_price - current_price) / entry_price
+    loss_pct = (entry_price - cur_price) / entry_price
+    gain_pct = (cur_price - entry_price) / entry_price
+
+    # ── Always active (even on day 1) ──────────────────────────────────────
     if loss_pct >= HARD_STOP_PCT:
-        return f"HARD_STOP({loss_pct:.1%}_loss)"
+        return f"HARD_STOP({loss_pct:.1%})"
 
-    # 2. Profit target
-    gain_pct = (current_price - entry_price) / entry_price
     if gain_pct >= PROFIT_TARGET_PCT:
-        return f"PROFIT_TARGET({gain_pct:.1%}_gain)"
+        return f"PROFIT_TARGET({gain_pct:.1%})"
 
-    # 3. Signal turned SHORT
+    # ── Soft exits — only after minimum hold period ────────────────────────
+    if days_held < MIN_HOLD_DAYS:
+        return None   # too early to judge trend/momentum signals
+
     if score.signal == "SHORT":
         return "SIGNAL_SHORT"
 
-    # 4. Momentum fading — composite below floor
-    if score.composite < EXIT_COMPOSITE_FLOOR:
-        return f"MOMENTUM_FADE(composite={score.composite:.2f})"
+    # Bear regime uses a tighter composite floor (exit faster when macro weak)
+    floor = EXIT_COMPOSITE_FLOOR if bull_regime else BEAR_COMPOSITE_FLOOR
+    if score.composite < floor:
+        return f"MOMENTUM_FADE(composite={score.composite:.2f},floor={floor})"
 
-    # 5. Trend break — ROC20 negative AND price below 50D MA (both required)
     if score.roc20 < 0 and score.price_vs_ma50 < 0:
         return f"TREND_BREAK(roc20={score.roc20:.1f}%,vs_ma={score.price_vs_ma50:.1f}%)"
 
-    return None  # keep holding
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -108,16 +108,16 @@ def check_exit_reason(
 # ---------------------------------------------------------------------------
 
 def get_entry_candidates(
-    ranked:    list[MomentumScore],
-    portfolio: PortfolioState,
+    ranked:      list[MomentumScore],
+    portfolio:   PortfolioState,
     bull_regime: bool,
 ) -> list[MomentumScore]:
     """
     Return new stocks to buy:
-    - LONG signal
-    - STRONG or MODERATE quality only (no WEAK)
-    - GOOD or OK entry type (not CHASE — overextended)
+    - STRONG signal only
+    - GOOD or OK entry type (not CHASE)
     - Not already held
+    - Not on re-entry cooldown
     - Fill up to PORTFOLIO_SIZE slots
     """
     if not bull_regime:
@@ -129,14 +129,25 @@ def get_entry_candidates(
         logger.info("Portfolio full — no new buys.")
         return []
 
-    candidates = [
-        s for s in ranked
-        if s.signal == "LONG"
-        and s.quality in ENTRY_QUALITY_FILTER
-        and s.entry_type in ("GOOD", "OK")
-        and not portfolio.has(s.symbol)
-    ]
-    return candidates[:slots]
+    candidates = []
+    for s in ranked:
+        if len(candidates) >= slots:
+            break
+        if s.signal != "LONG":
+            continue
+        if s.quality not in ENTRY_QUALITY_FILTER:
+            continue
+        if s.entry_type not in ("GOOD", "OK"):
+            continue
+        if portfolio.has(s.symbol):
+            continue
+        if portfolio.is_on_cooldown(s.symbol):
+            remaining = portfolio.cooldown_days_remaining(s.symbol)
+            logger.info(f"  SKIP {s.symbol} — cooldown ({remaining}d remaining)")
+            continue
+        candidates.append(s)
+
+    return candidates
 
 
 # ---------------------------------------------------------------------------
@@ -145,14 +156,16 @@ def get_entry_candidates(
 
 def run() -> None:
     now = ist_now()
+    composite_floor = EXIT_COMPOSITE_FLOOR  # will be overridden per position if bear
+
     logger.info("=" * 66)
     logger.info("  MOMENTUM DELIVERY BOT — DAILY SIGNAL SCAN")
-    logger.info(f"  Run time  : {now.strftime('%Y-%m-%d %H:%M:%S IST')}")
-    logger.info(f"  Portfolio : up to {PORTFOLIO_SIZE} stocks | ₹{POSITION_SIZE_INR:,.0f}/stock")
-    logger.info(f"  Order type: CNC delivery (NORMAL)")
-    logger.info(f"  Entry     : STRONG or MODERATE signals only")
-    logger.info(f"  Exits     : composite<{EXIT_COMPOSITE_FLOOR} | SHORT signal | "
-                f"trend break | stop {HARD_STOP_PCT:.0%} | target {PROFIT_TARGET_PCT:.0%}")
+    logger.info(f"  Run time    : {now.strftime('%Y-%m-%d %H:%M:%S IST')}")
+    logger.info(f"  Portfolio   : up to {PORTFOLIO_SIZE} stocks | ₹{POSITION_SIZE_INR:,.0f}/stock")
+    logger.info(f"  Entry filter: {', '.join(ENTRY_QUALITY_FILTER)} signals only")
+    logger.info(f"  Hard stop   : {HARD_STOP_PCT:.0%}  |  Target : {PROFIT_TARGET_PCT:.0%}")
+    logger.info(f"  Min hold    : {MIN_HOLD_DAYS} days  |  Cooldown: {15} days after exit")
+    logger.info(f"  Bear floor  : {BEAR_COMPOSITE_FLOOR} (vs {EXIT_COMPOSITE_FLOOR} in bull)")
     logger.info("=" * 66)
 
     # ── 1. Price data ─────────────────────────────────────────────────────────
@@ -177,31 +190,37 @@ def run() -> None:
     portfolio = PortfolioState()
     logger.info(portfolio.summary())
 
-    # ── 5. Scan: exits then entries ───────────────────────────────────────────
-    logger.info("\n[5/5] Scanning for exits and entries…")
-
+    # ── 5. Scan ───────────────────────────────────────────────────────────────
+    logger.info("\n[5/5] Scanning exits then entries…")
     session_sells = []
     session_buys  = []
 
     # ── EXITS ─────────────────────────────────────────────────────────────────
     for pos in portfolio.all():
         score  = rank_map.get(pos.symbol)
-        reason = check_exit_reason(pos, score)
+        reason = check_exit_reason(pos, score, bull_regime)
+
+        days_held = (date.today() - date.fromisoformat(pos.entry_date)).days
 
         if reason is None:
+            gain_loss = (
+                (score.current_price - pos.entry_price) / pos.entry_price
+                if score else 0.0
+            )
             logger.info(
                 f"  HOLD {pos.symbol:<14} "
                 f"composite={score.composite:.2f}  "
-                f"gain/loss={(score.current_price - pos.entry_price) / pos.entry_price:+.1%}"
+                f"held={days_held}d  "
+                f"P&L={gain_loss:+.1%}"
             )
             continue
 
-        current_price = score.current_price if score else pos.entry_price
+        cur_price = score.current_price if score else pos.entry_price
         ok = sell_delivery(pos.symbol, pos.quantity)
         if ok:
             log_sell(
                 symbol      = pos.symbol,
-                price       = current_price,
+                price       = cur_price,
                 quantity    = pos.quantity,
                 entry_price = pos.entry_price,
                 composite   = score.composite if score else 0.0,
@@ -210,14 +229,14 @@ def run() -> None:
             )
             session_sells.append({
                 "symbol":      pos.symbol,
-                "price":       current_price,
+                "price":       cur_price,
                 "entry_price": pos.entry_price,
                 "quantity":    pos.quantity,
-                "pnl_inr":     round((current_price - pos.entry_price) * pos.quantity, 2),
-                "pnl_pct":     round((current_price - pos.entry_price) / pos.entry_price * 100, 2),
+                "pnl_inr":     round((cur_price - pos.entry_price) * pos.quantity, 2),
+                "pnl_pct":     round((cur_price - pos.entry_price) / pos.entry_price * 100, 2),
                 "reason":      reason,
             })
-            portfolio.remove(pos.symbol)
+            portfolio.remove(pos.symbol)   # also records cooldown
         else:
             logger.error(f"  SELL FAILED {pos.symbol} — keeping in portfolio.")
 
@@ -231,13 +250,16 @@ def run() -> None:
         for s in entries:
             logger.info(
                 f"    ↑ {s.symbol:<14} composite={s.composite:.2f}  "
-                f"accel={s.acceleration:.2f}  quality={s.quality}  entry={s.entry_type}"
+                f"accel={s.acceleration:.2f}  [{s.quality}]  entry_type={s.entry_type}"
             )
 
     for score in entries:
         qty = calculate_quantity(score.current_price)
         if qty < 1:
-            logger.warning(f"  {score.symbol}: price ₹{score.current_price:.2f} too high for allocation, skipping.")
+            logger.warning(
+                f"  {score.symbol}: ₹{score.current_price:.2f} too high for "
+                f"₹{POSITION_SIZE_INR:,.0f} allocation, skipping."
+            )
             continue
 
         ok = buy_delivery(score.symbol, qty)
@@ -272,14 +294,13 @@ def run() -> None:
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print_session_summary(session_buys, session_sells)
-
     logger.info("\nPortfolio after today's scan:")
     logger.info(portfolio.summary())
 
     if not session_sells and not session_buys:
         logger.info("\nNo trades today — portfolio unchanged.")
 
-    logger.info("\nDone. positions.csv and trade_log.csv committed by workflow.")
+    logger.info("\nDone. positions.csv, cooldown.csv and trade_log.csv committed by workflow.")
 
 
 if __name__ == "__main__":

@@ -85,28 +85,49 @@ ACCEL_BULL    = 5.0     # Acceleration threshold for STRONG quality
 ACCEL_BEAR    = -5.0    # Acceleration floor for LONG signal
 
 # ---------------------------------------------------------------------------
-# Entry Filter  — only buy STRONG or MODERATE signals (not WEAK noise)
+# Entry Filter  — STRONG only: eliminates noisy MODERATE entries that
+# drive excessive turnover and transaction cost drag
 # ---------------------------------------------------------------------------
-ENTRY_QUALITY_FILTER   = ("STRONG", "MODERATE")
+ENTRY_QUALITY_FILTER   = ("STRONG",)      # Change 1: was ("STRONG", "MODERATE")
 
 # ---------------------------------------------------------------------------
 # Signal-Driven Exit Criteria  (checked daily, not on a calendar)
 # ---------------------------------------------------------------------------
-# 1. Momentum fade     — composite drops below this floor
-EXIT_COMPOSITE_FLOOR   = 1.5
+# 1. Hard stop  — position down this % from entry price → cut loss immediately
+HARD_STOP_PCT          = 0.06   # Change 2: widened from 3% → 6% (room to breathe)
 
-# 2. Trend break       — ROC20 turns negative AND price breaks below 50D MA
-#    Both conditions must be true simultaneously (avoids premature exits)
+# 2. Profit target — harvest gains when position up this % from entry
+PROFIT_TARGET_PCT      = 0.18   # 18% (unchanged)
 
-# 3. Hard stop         — position down this % from entry price → cut loss
-HARD_STOP_PCT          = 0.08   # 8%
+# 3. Momentum fade — composite drops below this floor → sell
+EXIT_COMPOSITE_FLOOR   = 1.5    # normal (bull) regime floor
 
-# 4. Profit target     — harvest gains when position up this % from entry
-PROFIT_TARGET_PCT      = 0.18   # 18%
+# 4. Bear regime floor — when market is in downtrend, exit faster
+BEAR_COMPOSITE_FLOOR   = 2.5    # Change 5: stricter floor during bear market
 
+# 5. Trend break — ROC20 < 0 AND price < 50D MA (both required)
+#    (no config needed — conditions are in code)
+
+# ---------------------------------------------------------------------------
+# Hold & Re-entry Controls  (reduce churn)
+# ---------------------------------------------------------------------------
+# Change 3: minimum days to hold before soft exits (TREND_BREAK, MOMENTUM_FADE)
+# are evaluated. Hard stop is ALWAYS active from day 1.
+MIN_HOLD_DAYS          = 7
+
+# Change 4: days after exiting a stock before it can be re-entered
+REENTRY_COOLDOWN_DAYS  = 15
+
+# ---------------------------------------------------------------------------
 # Market regime filter: don't open new positions if Nifty 50 is below 200D MA
+# ---------------------------------------------------------------------------
 MARKET_REGIME_FILTER   = True
 REGIME_TICKER          = "^NSEI"
+
+# ---------------------------------------------------------------------------
+# File paths
+# ---------------------------------------------------------------------------
+COOLDOWN_FILE          = "cooldown.csv"   # tracks recent exits for re-entry gate
 
 # ---------------------------------------------------------------------------
 # Position Sizing
