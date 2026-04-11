@@ -1,0 +1,69 @@
+name: Momentum Delivery — Daily Signal Scan
+
+# -----------------------------------------------------------------------
+# Run MANUALLY at ~3 PM IST on any trading day you want to scan.
+# GitHub Actions UI: Actions → "Momentum Delivery — Daily Signal Scan" → Run workflow
+#
+# What it does:
+#   1. Scores all Nifty 200 stocks via the momentum composite framework
+#   2. Checks every held position against signal-driven exit criteria:
+#        • Composite  < 1.5          (momentum fading)
+#        • Signal     = SHORT        (direction reversal)
+#        • ROC20 < 0 AND price < 50D MA  (trend break)
+#        • Position down ≥ 8%        (hard stop-loss)
+#        • Position up   ≥ 18%       (profit harvest)
+#   3. Buys new STRONG/MODERATE LONG signals up to 15 open slots
+#   4. Fires CNC delivery market orders via stocksdeveloper → Zerodha
+#   5. Commits updated positions.csv and trade_log.csv to the repo
+#
+# No schedule — fully manual. Run when you choose to scan.
+# -----------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+
+jobs:
+  daily-scan:
+    name: Daily Signal Scan & Trade
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+        working-directory: momentum-rotation-bot
+
+      - name: Run daily scan
+        env:
+          STOCKSDEVELOPER_API_KEY: ${{ secrets.STOCKSDEVELOPER_API_KEY }}
+          STOCKSDEVELOPER_ACCOUNT: ${{ secrets.STOCKSDEVELOPER_ACCOUNT }}
+        run: python main.py
+        working-directory: momentum-rotation-bot
+
+      - name: Commit updated portfolio state
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add momentum-rotation-bot/positions.csv \
+                  momentum-rotation-bot/trade_log.csv 2>/dev/null || true
+          git diff --staged --quiet && \
+            echo "No portfolio changes to commit." || \
+            git commit -m "Daily scan $(date -u '+%Y-%m-%d') — momentum delivery" && \
+            git push
