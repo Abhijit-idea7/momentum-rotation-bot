@@ -40,6 +40,18 @@ on:
         description: "Composite exit floor (default 1.5)"
         required: false
         default: "1.5"
+      bear_floor:
+        description: "Composite floor in bear regime (default 2.5)"
+        required: false
+        default: "2.5"
+      min_hold_days:
+        description: "Minimum hold days before soft exits apply (default 7)"
+        required: false
+        default: "7"
+      cooldown_days:
+        description: "Re-entry cooldown days after exit (default 15)"
+        required: false
+        default: "15"
       no_regime_filter:
         description: "Disable regime filter? true/false (default false)"
         required: false
@@ -80,6 +92,9 @@ jobs:
             --stop           "${{ github.event.inputs.hard_stop     || '0.08' }}" \
             --target         "${{ github.event.inputs.profit_target || '0.18' }}" \
             --floor          "${{ github.event.inputs.composite_floor || '1.5' }}" \
+            --bear-floor     "${{ github.event.inputs.bear_floor      || '2.5' }}" \
+            --min-hold       "${{ github.event.inputs.min_hold_days   || '7'   }}" \
+            --cooldown       "${{ github.event.inputs.cooldown_days   || '15'  }}" \
             ${{ github.event.inputs.no_regime_filter == 'true' && '--no-regime-filter' || '' }}
 
       - name: Upload backtest results
