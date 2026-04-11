@@ -20,11 +20,14 @@ from dataclasses import dataclass
 import pandas as pd
 
 from config import (
-    ACCEL_BEAR, ACCEL_BULL, EXIT_RANK_CUTOFF, MIN_COMPOSITE_SCORE,
+    ACCEL_BEAR, ACCEL_BULL, MIN_COMPOSITE_SCORE,
     MT_CAP, MT_FLOOR, MT_SCALE_NEG, MT_SCALE_POS,
     ST_CAP, ST_FLOOR, ST_SCALE_NEG, ST_SCALE_POS,
     TREND_BEAR, TREND_BULL,
 )
+
+# How many top candidates to surface as buy-eligible (not a hard portfolio limit)
+_CANDIDATE_POOL = 30
 
 logger = logging.getLogger(__name__)
 
@@ -184,7 +187,7 @@ def get_buy_candidates(ranked: list[MomentumScore], bull_regime: bool) -> list[M
         s for s in ranked
         if s.signal == "LONG" and s.entry_type in ("GOOD", "OK")
     ]
-    return eligible[:EXIT_RANK_CUTOFF]
+    return eligible[:_CANDIDATE_POOL]
 
 
 def print_ranked_table(ranked: list[MomentumScore], top_n: int = 30) -> None:
