@@ -45,14 +45,12 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
-        working-directory: momentum-rotation-bot
 
       - name: Run daily scan
         env:
           STOCKSDEVELOPER_API_KEY: ${{ secrets.STOCKSDEVELOPER_API_KEY }}
           STOCKSDEVELOPER_ACCOUNT: ${{ secrets.STOCKSDEVELOPER_ACCOUNT }}
         run: python main.py
-        working-directory: momentum-rotation-bot
 
       - name: Commit updated portfolio state
         if: always()
@@ -61,8 +59,7 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add momentum-rotation-bot/positions.csv \
-                  momentum-rotation-bot/trade_log.csv 2>/dev/null || true
+          git add positions.csv trade_log.csv 2>/dev/null || true
           git diff --staged --quiet && \
             echo "No portfolio changes to commit." || \
             git commit -m "Daily scan $(date -u '+%Y-%m-%d') — momentum delivery" && \
