@@ -41,13 +41,11 @@ import yfinance as yf
 from config import (
     ABSOLUTE_MOMENTUM_THRESHOLD,
     HARD_STOP_PCT,
-    HOLD_BUFFER,
     MIN_HISTORY_BARS,
     MOMENTUM_LOOKBACK_DAYS,
-    NIFTY200_UNIVERSE,
     SKIP_RECENT_DAYS,
-    TOP_N_HOLD,
 )
+from universes import get_universe, list_universes
 
 logging.basicConfig(
     level=logging.INFO,
@@ -453,23 +451,25 @@ def print_trade_stats(trades: pd.DataFrame) -> None:
 
 def parse_args():
     p = argparse.ArgumentParser(description="Dual Momentum Delivery — Monthly Backtest")
+    p.add_argument("--universe",       choices=list_universes(), default="NIFTY200",
+                   help="Universe to backtest: NIFTY200 or BEES (default: NIFTY200)")
     p.add_argument("--start",          default="2018-01-01",
                    help="Backtest start date (YYYY-MM-DD)")
     p.add_argument("--end",            default="2024-12-31",
                    help="Backtest end date (YYYY-MM-DD)")
-    p.add_argument("--portfolio-size", default=TOP_N_HOLD,         type=int,
-                   help=f"Max positions (default {TOP_N_HOLD})")
-    p.add_argument("--capital",        default=INITIAL_CAPITAL,    type=float,
+    p.add_argument("--portfolio-size", default=None,              type=int,
+                   help="Max positions (default: universe default — 15 for NIFTY200, 5 for BEES)")
+    p.add_argument("--capital",        default=INITIAL_CAPITAL,   type=float,
                    help=f"Initial capital in Rs (default {INITIAL_CAPITAL:,.0f})")
     p.add_argument("--lookback",       default=MOMENTUM_LOOKBACK_DAYS, type=int,
                    help=f"Momentum lookback in trading days (default {MOMENTUM_LOOKBACK_DAYS})")
-    p.add_argument("--skip",           default=SKIP_RECENT_DAYS,   type=int,
+    p.add_argument("--skip",           default=SKIP_RECENT_DAYS,  type=int,
                    help=f"Skip-month days (default {SKIP_RECENT_DAYS})")
     p.add_argument("--abs-threshold",  default=ABSOLUTE_MOMENTUM_THRESHOLD, type=float,
                    help=f"Absolute momentum threshold, e.g. -0.05 = -5%% (default {ABSOLUTE_MOMENTUM_THRESHOLD})")
-    p.add_argument("--hold-buffer",    default=HOLD_BUFFER,        type=int,
-                   help=f"Sell if rank > this (default {HOLD_BUFFER})")
-    p.add_argument("--hard-stop",      default=HARD_STOP_PCT,      type=float,
+    p.add_argument("--hold-buffer",    default=None,              type=int,
+                   help="Sell if rank > this (default: universe default — 20 for NIFTY200, 7 for BEES)")
+    p.add_argument("--hard-stop",      default=HARD_STOP_PCT,     type=float,
                    help=f"Hard stop fraction e.g. 0.15 (default {HARD_STOP_PCT})")
     p.add_argument("--no-abs-filter",    action="store_true",
                    help="Disable absolute momentum filter (pure relative momentum)")
@@ -479,28 +479,38 @@ def parse_args():
 
 
 def main():
-    args          = parse_args()
-    use_abs       = not args.no_abs_filter
-    use_weekly    = not args.no_weekly_stop
-    hard_stop     = args.hard_stop if args.hard_stop and args.hard_stop > 0 else None
-    sep           = "=" * 68
+    args       = parse_args()
+    ucfg       = get_universe(args.universe)
+    use_abs    = not args.no_abs_filter
+    use_weekly = not args.no_weekly_stop
+    hard_stop  = args.hard_stop if args.hard_stop and args.hard_stop > 0 else None
 
+    # Universe-specific defaults (overridable via CLI)
+    port_size   = args.portfolio_size if args.portfolio_size is not None else ucfg.top_n_hold
+    hold_buffer = args.hold_buffer    if args.hold_buffer    is not None else ucfg.hold_buffer
+
+    # Output file names include universe suffix
+    out_results = f"backtest_results_{ucfg.name.lower()}.csv"
+    out_trades  = f"backtest_trades_{ucfg.name.lower()}.csv"
+    out_perf    = f"backtest_performance_{ucfg.name.lower()}.csv"
+
+    sep = "=" * 68
     print(sep)
     print("  DUAL MOMENTUM DELIVERY BOT — MONTHLY BACKTEST")
     print(f"  Period          : {args.start}  ->  {args.end}")
-    print(f"  Universe        : Nifty 200 ({len(NIFTY200_UNIVERSE)} stocks)")
-    print(f"  Portfolio size  : {args.portfolio_size} equal-weight slots")
+    print(f"  Universe        : {ucfg.display_name}  ({len(ucfg.symbols)} symbols)")
+    print(f"  Portfolio size  : {port_size} equal-weight slots")
     print(f"  Lookback        : {args.lookback} days (~12 months)")
     print(f"  Skip recent     : {args.skip} days (~1 month, avoids reversal)")
     print(f"  Abs. momentum   : {'ON — threshold ' + str(args.abs_threshold) if use_abs else 'OFF (pure relative)'}")
-    print(f"  Hold buffer     : sell if rank > {args.hold_buffer}")
+    print(f"  Hold buffer     : sell if rank > {hold_buffer}")
     print(f"  Hard stop       : {hard_stop:.0%}" if hard_stop else "  Hard stop       : OFF")
     print(f"  Weekly stop     : {'ON (Friday hard stop checks — mirrors live bot)' if use_weekly else 'OFF'}")
     print(f"  Transaction cost: {TRANSACTION_COST*100:.2f}% per trade (one-way)")
     print(f"  Initial capital : Rs{args.capital:,.0f}")
     print(sep)
 
-    prices_df, bench = download_prices(NIFTY200_UNIVERSE, args.start, args.end)
+    prices_df, bench = download_prices(list(ucfg.symbols), args.start, args.end)
     if prices_df.empty:
         logger.error("No price data. Exiting.")
         sys.exit(1)
@@ -511,12 +521,12 @@ def main():
         bench           = bench,
         start           = args.start,
         end             = args.end,
-        portfolio_size  = args.portfolio_size,
+        portfolio_size  = port_size,
         initial_capital = args.capital,
         lookback        = args.lookback,
         skip            = args.skip,
         abs_threshold   = args.abs_threshold,
-        hold_buffer     = args.hold_buffer,
+        hold_buffer     = hold_buffer,
         hard_stop       = hard_stop,
         use_abs_filter  = use_abs,
         use_weekly_stop = use_weekly,
@@ -554,7 +564,7 @@ def main():
 
     # ── Annual returns ────────────────────────────────────────────────────────
     print(f"\n{sep}")
-    print("  ANNUAL RETURNS")
+    print(f"  ANNUAL RETURNS — {ucfg.display_name}")
     print(sep)
     print(f"  {'Year':<8} {'Strategy':>12} {'Nifty 50':>12} {'Alpha':>10}")
     print("  " + "-" * 46)
@@ -585,17 +595,17 @@ def main():
     # ── Save outputs ──────────────────────────────────────────────────────────
     nav_df = nav.reset_index()
     nav_df.columns = ["date", "nav"]
-    nav_df.to_csv("backtest_results.csv", index=False)
+    nav_df.to_csv(out_results, index=False)
 
     if not trades.empty:
-        trades.to_csv("backtest_trades.csv", index=False)
+        trades.to_csv(out_trades, index=False)
 
     rows = [sm]
     if bm:
         rows.append(bm)
-    pd.DataFrame(rows).to_csv("backtest_performance.csv", index=False)
+    pd.DataFrame(rows).to_csv(out_perf, index=False)
 
-    print(f"\n  Saved: backtest_results.csv | backtest_trades.csv | backtest_performance.csv")
+    print(f"\n  Saved: {out_results} | {out_trades} | {out_perf}")
     print(f"\n{sep}")
     print("  BACKTEST COMPLETE")
     print(sep)

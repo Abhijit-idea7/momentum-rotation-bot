@@ -1,12 +1,15 @@
 """
 trade_logger.py
 ---------------
-Appends every BUY/SELL trade to trade_log.csv which is committed to the repo.
-Provides a full history of all monthly rebalance actions and P&L on sells.
+Appends every BUY/SELL trade to a universe-specific trade_log CSV
+which is committed to the repo after every rebalance.
 
 CSV columns:
   date, symbol, action, price, quantity, value_inr,
   reason, momentum_return, rank, pnl_inr, pnl_pct
+
+Pass trade_log_file=ucfg.trade_log_file to route to the correct CSV.
+Defaults to the legacy TRADE_LOG_FILE from config for backward compatibility.
 """
 
 import csv
@@ -14,7 +17,7 @@ import logging
 from datetime import date
 from pathlib import Path
 
-from config import TRADE_LOG_FILE
+from config import TRADE_LOG_FILE as _DEFAULT_TRADE_LOG_FILE
 
 logger = logging.getLogger(__name__)
 
@@ -31,8 +34,9 @@ def log_buy(
     momentum_return: float,
     rank:            int,
     reason:          str = "MOMENTUM_ENTRY",
+    trade_log_file:  str = _DEFAULT_TRADE_LOG_FILE,
 ) -> None:
-    """Log a BUY trade to trade_log.csv."""
+    """Log a BUY trade to the universe trade log."""
     _append_row(
         symbol          = symbol,
         action          = "BUY",
@@ -43,6 +47,7 @@ def log_buy(
         rank            = rank,
         pnl_inr         = 0.0,
         pnl_pct         = 0.0,
+        trade_log_file  = trade_log_file,
     )
 
 
@@ -54,8 +59,9 @@ def log_sell(
     momentum_return: float,
     rank:            int,
     reason:          str,
+    trade_log_file:  str = _DEFAULT_TRADE_LOG_FILE,
 ) -> None:
-    """Log a SELL trade to trade_log.csv, computing realised P&L."""
+    """Log a SELL trade to the universe trade log, computing realised P&L."""
     pnl_inr = round((price - entry_price) * quantity, 2)
     pnl_pct = round((price - entry_price) / entry_price * 100, 2) if entry_price > 0 else 0.0
 
@@ -76,6 +82,7 @@ def log_sell(
         rank            = rank,
         pnl_inr         = pnl_inr,
         pnl_pct         = pnl_pct,
+        trade_log_file  = trade_log_file,
     )
 
 
@@ -89,8 +96,9 @@ def _append_row(
     rank:            int,
     pnl_inr:         float,
     pnl_pct:         float,
+    trade_log_file:  str = _DEFAULT_TRADE_LOG_FILE,
 ) -> None:
-    path = Path(TRADE_LOG_FILE)
+    path = Path(trade_log_file)
     file_exists = path.exists() and path.stat().st_size > 0
     value_inr = round(price * quantity, 2)
 

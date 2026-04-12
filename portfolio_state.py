@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
 
-from config import POSITIONS_FILE
+from config import POSITIONS_FILE as _DEFAULT_POSITIONS_FILE
 
 logger = logging.getLogger(__name__)
 
@@ -38,18 +38,25 @@ class DeliveryPosition:
 
 
 class PortfolioState:
-    """Loads and saves open positions from/to positions.csv."""
+    """Loads and saves open positions from/to a universe-specific CSV.
 
-    def __init__(self) -> None:
+    Args:
+        positions_file: Path to the CSV file for this universe.
+            Defaults to the legacy POSITIONS_FILE from config.
+            Pass ucfg.positions_file to use the universe-specific file.
+    """
+
+    def __init__(self, positions_file: str = _DEFAULT_POSITIONS_FILE) -> None:
+        self._file = positions_file
         self._positions: dict[str, DeliveryPosition] = {}
         self._load()
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
     def _load(self) -> None:
-        path = Path(POSITIONS_FILE)
+        path = Path(self._file)
         if not path.exists():
-            logger.info(f"{POSITIONS_FILE} not found — starting with empty portfolio.")
+            logger.info(f"{self._file} not found — starting with empty portfolio.")
             return
         with open(path, newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
@@ -64,16 +71,16 @@ class PortfolioState:
                     rank_at_entry            = int(row["rank_at_entry"]),
                 )
                 self._positions[pos.symbol] = pos
-        logger.info(f"Loaded {len(self._positions)} open positions from {POSITIONS_FILE}")
+        logger.info(f"Loaded {len(self._positions)} open positions from {self._file}")
 
     def save(self) -> None:
-        """Overwrite positions.csv with current state."""
-        with open(POSITIONS_FILE, "w", newline="", encoding="utf-8") as f:
+        """Overwrite the positions file with current state."""
+        with open(self._file, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=_POS_FIELDS)
             writer.writeheader()
             for pos in self._positions.values():
                 writer.writerow(asdict(pos))
-        logger.info(f"Saved {len(self._positions)} open positions to {POSITIONS_FILE}")
+        logger.info(f"Saved {len(self._positions)} open positions to {self._file}")
 
     # ── Queries ───────────────────────────────────────────────────────────────
 
