@@ -184,6 +184,7 @@ def run_backtest(
     hold_buffer:     int,
     hard_stop:       float | None,
     use_abs_filter:  bool,
+    use_weekly_stop: bool = True,
 ) -> dict:
     required_bars = lookback + skip + 5
 
@@ -211,7 +212,6 @@ def run_backtest(
 
         # Skip bars before the requested start date
         if date < pd.Timestamp(start):
-            # Still need to mark-to-market for initial_capital baseline
             nav_daily[date] = initial_capital
             continue
 
@@ -226,6 +226,42 @@ def run_backtest(
             p = day_prices.get(sym)
             if p is not None and not np.isnan(p):
                 port_value += pos["shares"] * p
+
+        # ── Weekly hard stop — every Friday (mirrors weekly_scan.py) ──────────
+        # Runs BEFORE the monthly rebalance so that if month-end falls on a
+        # Friday, weekly stops fire first and the monthly can refill freed slots.
+        is_friday = date.dayofweek == 4   # 0 = Monday, 4 = Friday
+        if use_weekly_stop and is_friday and hard_stop is not None and holdings:
+            weekly_stops = []
+            for sym, pos in holdings.items():
+                cur_p = day_prices.get(sym)
+                if cur_p is None or np.isnan(cur_p):
+                    continue
+                loss_pct = (pos["entry_price"] - cur_p) / pos["entry_price"]
+                if loss_pct >= hard_stop:
+                    weekly_stops.append((sym, cur_p, loss_pct))
+
+            for sym, cur_p, loss_pct in weekly_stops:
+                pos      = holdings.pop(sym)
+                proceeds = pos["shares"] * cur_p * (1 - TRANSACTION_COST)
+                cash    += proceeds
+                pnl_inr  = round((cur_p - pos["entry_price"]) * pos["shares"], 2)
+                pnl_pct  = round((cur_p - pos["entry_price"]) / pos["entry_price"] * 100, 2)
+                trades.append({
+                    "date":            date.date().isoformat(),
+                    "symbol":          sym,
+                    "action":          "SELL",
+                    "price":           round(cur_p, 2),
+                    "shares":          pos["shares"],
+                    "value_inr":       round(proceeds, 0),
+                    "entry_price":     round(pos["entry_price"], 2),
+                    "hold_days":       (date - pos["entry_date"]).days,
+                    "reason":          "WEEKLY_HARD_STOP",
+                    "momentum_return": 0.0,
+                    "rank":            0,
+                    "pnl_inr":         pnl_inr,
+                    "pnl_pct":         pnl_pct,
+                })
 
         # ── Monthly rebalance on month-end dates only ─────────────────────────
         if date in month_end_set:
@@ -255,11 +291,12 @@ def run_backtest(
                     to_sell.append((sym, "RISK_OFF"))
                     continue
 
-                # Hard stop
+                # Monthly hard stop (backup — catches any breach missed between Fridays)
                 if hard_stop is not None:
                     loss_pct = (pos["entry_price"] - cur_p) / pos["entry_price"]
                     if loss_pct >= hard_stop:
-                        to_sell.append((sym, "HARD_STOP"))
+                        rsn = "MONTHLY_HARD_STOP" if use_weekly_stop else "HARD_STOP"
+                        to_sell.append((sym, rsn))
                         continue
 
                 # Rank exit
@@ -434,16 +471,19 @@ def parse_args():
                    help=f"Sell if rank > this (default {HOLD_BUFFER})")
     p.add_argument("--hard-stop",      default=HARD_STOP_PCT,      type=float,
                    help=f"Hard stop fraction e.g. 0.15 (default {HARD_STOP_PCT})")
-    p.add_argument("--no-abs-filter",  action="store_true",
+    p.add_argument("--no-abs-filter",    action="store_true",
                    help="Disable absolute momentum filter (pure relative momentum)")
+    p.add_argument("--no-weekly-stop",  action="store_true",
+                   help="Disable weekly Friday hard stop simulation (default: enabled)")
     return p.parse_args()
 
 
 def main():
-    args       = parse_args()
-    use_abs    = not args.no_abs_filter
-    hard_stop  = args.hard_stop if args.hard_stop and args.hard_stop > 0 else None
-    sep        = "=" * 68
+    args          = parse_args()
+    use_abs       = not args.no_abs_filter
+    use_weekly    = not args.no_weekly_stop
+    hard_stop     = args.hard_stop if args.hard_stop and args.hard_stop > 0 else None
+    sep           = "=" * 68
 
     print(sep)
     print("  DUAL MOMENTUM DELIVERY BOT — MONTHLY BACKTEST")
@@ -455,6 +495,7 @@ def main():
     print(f"  Abs. momentum   : {'ON — threshold ' + str(args.abs_threshold) if use_abs else 'OFF (pure relative)'}")
     print(f"  Hold buffer     : sell if rank > {args.hold_buffer}")
     print(f"  Hard stop       : {hard_stop:.0%}" if hard_stop else "  Hard stop       : OFF")
+    print(f"  Weekly stop     : {'ON (Friday hard stop checks — mirrors live bot)' if use_weekly else 'OFF'}")
     print(f"  Transaction cost: {TRANSACTION_COST*100:.2f}% per trade (one-way)")
     print(f"  Initial capital : Rs{args.capital:,.0f}")
     print(sep)
@@ -478,6 +519,7 @@ def main():
         hold_buffer     = args.hold_buffer,
         hard_stop       = hard_stop,
         use_abs_filter  = use_abs,
+        use_weekly_stop = use_weekly,
     )
     nav    = result["nav"]
     trades = result["trades"]
