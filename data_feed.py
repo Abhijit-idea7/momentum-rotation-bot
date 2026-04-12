@@ -2,7 +2,12 @@
 data_feed.py
 ------------
 Fetches daily OHLCV price data from Yahoo Finance for NSE-listed stocks.
-Used by the momentum scorer to compute all metrics.
+Used by the momentum ranker to compute 12M-1M momentum returns.
+
+Key functions:
+  fetch_universe_prices()  — batch download closes for the full universe
+  get_absolute_momentum()  — check Nifty 50 absolute momentum (risk-on/off)
+  get_current_price()      — latest close for a single stock
 """
 
 import logging
@@ -11,7 +16,14 @@ import time
 import pandas as pd
 import yfinance as yf
 
-from config import MIN_HISTORY_BARS, NIFTY200_UNIVERSE, REGIME_MA_PERIOD, REGIME_TICKER
+from config import (
+    ABSOLUTE_MOMENTUM_THRESHOLD,
+    MIN_HISTORY_BARS,
+    MOMENTUM_LOOKBACK_DAYS,
+    NIFTY200_UNIVERSE,
+    REGIME_TICKER,
+    SKIP_RECENT_DAYS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,38 +35,17 @@ def _ns(symbol: str) -> str:
     return f"{symbol}.NS"
 
 
-def fetch_daily_history(symbol: str, period: str = "2y") -> pd.DataFrame | None:
-    """
-    Fetch 2 years of daily OHLCV for a single symbol.
-    Returns clean DataFrame or None on failure.
-    """
-    for attempt in range(3):
-        try:
-            df = yf.Ticker(_ns(symbol)).history(interval="1d", period=period, auto_adjust=True)
-            if df.empty or len(df) < MIN_HISTORY_BARS:
-                logger.warning(f"{symbol}: insufficient data ({len(df)} bars)")
-                return None
-            df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-            df.index = pd.to_datetime(df.index).tz_localize(None)
-            return df
-        except Exception as e:
-            logger.warning(f"{symbol}: fetch error attempt {attempt + 1} — {e}")
-            time.sleep(2)
-    logger.error(f"{symbol}: all fetch attempts failed.")
-    return None
-
-
-def fetch_universe_prices(symbols: list[str] = None, period: str = "2y") -> pd.DataFrame:
+def fetch_universe_prices(symbols: list[str] = None, period: str = "3y") -> pd.DataFrame:
     """
     Batch download close prices for the full universe.
     Returns a DataFrame with dates as index and symbols as columns.
-    Drops symbols with >40% missing data.
+    Drops symbols with >40% missing data. Uses 3y period (need 13+ months of data).
     """
     if symbols is None:
         symbols = NIFTY200_UNIVERSE
 
     tickers = [_ns(s) for s in symbols]
-    logger.info(f"Downloading {len(tickers)} tickers (period={period})…")
+    logger.info(f"Downloading {len(tickers)} tickers (period={period})...")
 
     all_dfs = []
     for i in range(0, len(tickers), _BATCH_SIZE):
@@ -69,7 +60,6 @@ def fetch_universe_prices(symbols: list[str] = None, period: str = "2y") -> pd.D
                     progress=False,
                     group_by="ticker",
                 )
-                # yfinance returns multi-level columns when multiple tickers
                 if isinstance(raw.columns, pd.MultiIndex):
                     closes = raw.xs("Close", level=1, axis=1)
                 else:
@@ -99,8 +89,67 @@ def fetch_universe_prices(symbols: list[str] = None, period: str = "2y") -> pd.D
     return prices
 
 
+def get_absolute_momentum(
+    lookback: int = None,
+    skip: int = None,
+    threshold: float = None,
+) -> tuple[bool, float]:
+    """
+    Dual Momentum absolute momentum check for Nifty 50.
+
+    Computes Nifty 50's 12M-1M return and compares it to a threshold.
+      True  = risk-on  (return > threshold) → proceed to relative momentum
+      False = risk-off (return <= threshold) → sell all, go to cash
+
+    Args:
+        lookback:  Trading days for lookback window (default: MOMENTUM_LOOKBACK_DAYS = 252)
+        skip:      Trading days to skip at end (default: SKIP_RECENT_DAYS = 21)
+        threshold: Minimum return required (default: ABSOLUTE_MOMENTUM_THRESHOLD = 0.06)
+
+    Returns:
+        (is_risk_on: bool, actual_return: float)
+    """
+    if lookback is None:
+        lookback = MOMENTUM_LOOKBACK_DAYS
+    if skip is None:
+        skip = SKIP_RECENT_DAYS
+    if threshold is None:
+        threshold = ABSOLUTE_MOMENTUM_THRESHOLD
+
+    required = lookback + skip + 10
+
+    try:
+        df = yf.Ticker(REGIME_TICKER).history(
+            period="3y", interval="1d", auto_adjust=True
+        )
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+
+        if len(df) < required:
+            logger.warning(
+                f"Insufficient Nifty data ({len(df)} bars, need {required}) "
+                f"— defaulting to RISK-ON."
+            )
+            return True, 0.0
+
+        price_end   = float(df["Close"].iloc[-(skip + 1)])           # ~1 month ago
+        price_start = float(df["Close"].iloc[-(lookback + skip + 1)]) # ~13 months ago
+        abs_return  = (price_end - price_start) / price_start
+
+        is_risk_on = abs_return > threshold
+        logger.info(
+            f"Absolute momentum: Nifty 12M-1M = {abs_return:+.1%}  "
+            f"threshold = {threshold:.0%}  "
+            f"-> {'RISK-ON  (proceed to buy)' if is_risk_on else 'RISK-OFF (go to cash)'}"
+        )
+        return is_risk_on, abs_return
+
+    except Exception as e:
+        logger.warning(f"Absolute momentum check error: {e} — defaulting to RISK-ON.")
+        return True, 0.0
+
+
 def get_current_price(symbol: str) -> float | None:
-    """Fetch the latest available close price for a symbol."""
+    """Fetch the latest available close price for a single symbol."""
     try:
         df = yf.Ticker(_ns(symbol)).history(period="5d", interval="1d", auto_adjust=True)
         if df.empty:
@@ -109,30 +158,3 @@ def get_current_price(symbol: str) -> float | None:
     except Exception as e:
         logger.warning(f"{symbol}: price fetch error — {e}")
         return None
-
-
-def get_regime_signal(lookback: int = None) -> bool:
-    """
-    Returns True (bull regime) if Nifty 50 is above its regime MA.
-    Returns False (bear regime) → new buys are blocked.
-    lookback defaults to REGIME_MA_PERIOD from config (100D).
-    """
-    if lookback is None:
-        lookback = REGIME_MA_PERIOD
-    try:
-        period = "2y" if lookback > 200 else "1y"
-        df = yf.Ticker(REGIME_TICKER).history(period=period, interval="1d", auto_adjust=True)
-        if len(df) < lookback:
-            logger.warning("Insufficient regime data — defaulting to bull.")
-            return True
-        ma = df["Close"].iloc[-lookback:].mean()
-        current = float(df["Close"].iloc[-1])
-        is_bull = current > ma
-        logger.info(
-            f"Market regime: Nifty={current:.0f}  {lookback}D-MA={ma:.0f}  "
-            f"→ {'BULL ✓' if is_bull else 'BEAR — new buys blocked'}"
-        )
-        return is_bull
-    except Exception as e:
-        logger.warning(f"Regime check error: {e} — defaulting to bull.")
-        return True

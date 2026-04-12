@@ -1,61 +1,53 @@
 """
 backtest.py
 -----------
-Momentum Delivery Bot — Daily Signal Backtest.
+Dual Momentum Delivery Bot — Monthly Backtest Engine.
 
 Simulates the exact same logic as main.py across historical data.
 
-Exit rules (identical to live bot):
-  1. Hard stop    — down ≥ hard_stop% from entry              [always active, day 1+]
-  2. Profit target— up  ≥ profit_target%                       [always active]
-  3. Momentum fade— composite < floor                          [after min_hold_days]
-                    floor = bear_floor in bear regime, composite_floor in bull
-  4. Trend break  — ROC20 < trend_roc AND price < 50D MA by trend_ma  [after min_hold_days]
-  (SIGNAL_SHORT removed — MOMENTUM_FADE at 1.5 already covers composite-based exits)
+Rebalance logic (run on the last trading day of each month):
+  1. Absolute momentum: Is Nifty 50's 12M-1M return > abs_threshold?
+     NO  -> sell all, sit in cash until next month's check
+     YES -> proceed to relative momentum
+  2. Relative momentum: Rank Nifty 200 by 12M-1M return
+     SELL: holdings ranked below hold_buffer
+     BUY:  fill slots with top portfolio_size stocks not already held
+  3. Hard stop: sell any position down > hard_stop from entry (checked monthly)
 
-Entry rules:
-  • STRONG signal only (ENTRY_QUALITY_FILTER)
-  • GOOD or OK entry type
-  • Not already held + slot available + bull regime
-  • Not on re-entry cooldown (cooldown_days after last exit)
+NAV is marked-to-market every trading day, but trades only happen on
+month-end dates. This gives accurate Sharpe/max-drawdown calculations.
 
 Usage:
   python backtest.py
-  python backtest.py --start 2021-01-01 --end 2024-12-31
-  python backtest.py --stop 0.07 --target 0.20 --min-hold 10 --cooldown 20
-  python backtest.py --no-regime-filter
+  python backtest.py --start 2018-01-01 --end 2024-12-31
+  python backtest.py --abs-threshold 0.0 --no-abs-filter
+  python backtest.py --lookback 252 --skip 21 --hold-buffer 20
 
-Outputs (GitHub Actions artifacts):
+Outputs (uploaded as GitHub Actions artifacts):
   backtest_results.csv     — daily NAV
-  backtest_trades.csv      — every BUY/SELL with hold days, reason, P&L
-  backtest_performance.csv — metrics vs Nifty 50
+  backtest_trades.csv      — every BUY/SELL with hold months, reason, P&L
+  backtest_performance.csv — metrics vs Nifty 50 benchmark
 """
 
 import argparse
 import logging
 import sys
 from datetime import timedelta
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
 from config import (
-    BEAR_COMPOSITE_FLOOR,
-    ENTRY_QUALITY_FILTER,
-    EXIT_COMPOSITE_FLOOR,
+    ABSOLUTE_MOMENTUM_THRESHOLD,
     HARD_STOP_PCT,
+    HOLD_BUFFER,
     MIN_HISTORY_BARS,
-    MIN_HOLD_DAYS,
+    MOMENTUM_LOOKBACK_DAYS,
     NIFTY200_UNIVERSE,
-    PROFIT_TARGET_PCT,
-    REENTRY_COOLDOWN_DAYS,
-    REGIME_MA_PERIOD,
-    TREND_BREAK_MA_PCT,
-    TREND_BREAK_ROC20,
+    SKIP_RECENT_DAYS,
+    TOP_N_HOLD,
 )
-from momentum_scorer import _score_single
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,106 +62,111 @@ INITIAL_CAPITAL  = 1_500_000
 RISK_FREE_RATE   = 0.065
 
 
-# ── Data ─────────────────────────────────────────────────────────────────────
+# ── Data download ─────────────────────────────────────────────────────────────
 
-def download_prices(symbols: list[str], start: str, end: str):
+def download_prices(symbols: list[str], start: str, end: str) -> tuple[pd.DataFrame, pd.Series]:
+    """Download all stock + benchmark closes for the backtest period."""
+    # Add extra history for the lookback window before start date
+    extended_start = pd.Timestamp(start) - timedelta(days=430)  # ~14 months buffer
     tickers = [f"{s}.NS" for s in symbols] + [BENCHMARK_TICKER]
-    logger.info(f"Downloading {len(tickers)} tickers {start} → {end}…")
-    raw = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=True)
-    closes = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw[["Close"]]
+
+    logger.info(f"Downloading {len(tickers)} tickers {extended_start.date()} -> {end}...")
+    raw = yf.download(
+        tickers,
+        start=extended_start.strftime("%Y-%m-%d"),
+        end=end,
+        auto_adjust=True,
+        progress=True,
+    )
+    closes = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw
     closes.index = pd.to_datetime(closes.index).tz_localize(None)
+
     bench  = closes[BENCHMARK_TICKER].dropna() if BENCHMARK_TICKER in closes.columns else None
     stocks = closes.drop(columns=[BENCHMARK_TICKER], errors="ignore").copy()
     stocks.columns = [c.replace(".NS", "") for c in stocks.columns]
+
     threshold = int(0.60 * len(stocks))
     stocks = stocks.dropna(axis=1, thresh=threshold).ffill().bfill()
     logger.info(f"Retained {len(stocks.columns)} stocks after quality filter")
     return stocks, bench
 
 
-# ── Per-bar scoring ───────────────────────────────────────────────────────────
+def find_month_ends(index: pd.DatetimeIndex, start: str, end: str) -> list[pd.Timestamp]:
+    """Return the last available trading date for each calendar month in [start, end]."""
+    start_ts = pd.Timestamp(start)
+    end_ts   = pd.Timestamp(end)
+    in_range = index[(index >= start_ts) & (index <= end_ts)]
+    df = pd.DataFrame({"date": in_range})
+    df["month"] = df["date"].dt.to_period("M")
+    return df.groupby("month")["date"].last().tolist()
 
-def score_bar(prices_df: pd.DataFrame, bar_idx: int) -> pd.DataFrame:
+
+# ── Per-bar momentum ranking ──────────────────────────────────────────────────
+
+def rank_at_bar(
+    prices_df: pd.DataFrame,
+    bar_idx:   int,
+    lookback:  int,
+    skip:      int,
+) -> pd.DataFrame:
+    """
+    Compute 12M-1M momentum return for every stock at a given bar index.
+    Returns DataFrame indexed by symbol with columns: momentum_return, price, rank.
+    """
+    required = lookback + skip + 5
     rows = []
-    for sym in prices_df.columns:
-        series = prices_df[sym].iloc[:bar_idx + 1].dropna()
-        s = _score_single(sym, series)
-        if s:
-            rows.append({
-                "symbol":     s.symbol,
-                "composite":  s.composite,
-                "accel":      s.acceleration,
-                "roc20":      s.roc20,
-                "vs_ma50":    s.price_vs_ma50,
-                "signal":     s.signal,
-                "entry_type": s.entry_type,
-                "quality":    s.quality,
-                "price":      s.current_price,
-            })
+    slice_df = prices_df.iloc[: bar_idx + 1]
+
+    for sym in slice_df.columns:
+        series = slice_df[sym].dropna()
+        if len(series) < required:
+            continue
+        try:
+            price_end   = float(series.iloc[-(skip + 1)])
+            price_start = float(series.iloc[-(lookback + skip + 1)])
+            current     = float(series.iloc[-1])
+        except (IndexError, ValueError):
+            continue
+        if price_start <= 0 or current <= 0:
+            continue
+        mom = (price_end - price_start) / price_start
+        rows.append({"symbol": sym, "momentum_return": mom, "price": current})
+
     if not rows:
         return pd.DataFrame()
+
     df = pd.DataFrame(rows).set_index("symbol")
-    df.sort_values("composite", ascending=False, inplace=True)
+    df.sort_values("momentum_return", ascending=False, inplace=True)
     df["rank"] = range(1, len(df) + 1)
     return df
 
 
-def regime_bull(bench: pd.Series, bar_idx: int, ma_period: int = None) -> bool:
-    if ma_period is None:
-        ma_period = REGIME_MA_PERIOD
-    if bench is None or bar_idx < ma_period:
-        return True
-    window = bench.iloc[max(0, bar_idx - ma_period): bar_idx + 1].dropna()
-    return float(bench.iloc[bar_idx]) > float(window.mean()) if len(window) >= 50 else True
-
-
-# ── Exit evaluation ───────────────────────────────────────────────────────────
-
-def eval_exit(
-    entry_price:     float,
-    entry_date:      pd.Timestamp,
-    current_date:    pd.Timestamp,
-    current_price:   float,
-    score_row,                      # pd.Series or None
-    is_bull:         bool,
-    hard_stop:       float,
-    profit_target:   float,
-    composite_floor: float,
-    bear_floor:      float,
-    min_hold_days:   int,
-    trend_roc:       float = None,
-    trend_ma:        float = None,
-) -> str | None:
-    if trend_roc is None:
-        trend_roc = TREND_BREAK_ROC20
-    if trend_ma is None:
-        trend_ma = TREND_BREAK_MA_PCT
-
-    if score_row is None:
-        return "DATA_GAP"
-
-    days_held = (current_date - entry_date).days
-    loss_pct  = (entry_price - current_price) / entry_price
-    gain_pct  = (current_price - entry_price) / entry_price
-
-    # Always active
-    if loss_pct >= hard_stop:
-        return "HARD_STOP"
-    if gain_pct >= profit_target:
-        return "PROFIT_TARGET"
-
-    # Soft exits after minimum hold
-    if days_held < min_hold_days:
-        return None
-
-    floor = composite_floor if is_bull else bear_floor
-    if score_row["composite"] < floor:
-        return "MOMENTUM_FADE"
-
-    if score_row["roc20"] < trend_roc and score_row["vs_ma50"] < trend_ma:
-        return "TREND_BREAK"
-
-    return None
+def abs_momentum_at_bar(
+    bench:     pd.Series,
+    bar_idx:   int,
+    lookback:  int,
+    skip:      int,
+    threshold: float,
+) -> tuple[bool, float]:
+    """
+    Compute Nifty 50 absolute momentum at a given bar index.
+    Returns (is_risk_on, abs_return).
+    """
+    if bench is None:
+        return True, 0.0
+    required = lookback + skip + 5
+    series = bench.iloc[: bar_idx + 1].dropna()
+    if len(series) < required:
+        return True, 0.0
+    try:
+        price_end   = float(series.iloc[-(skip + 1)])
+        price_start = float(series.iloc[-(lookback + skip + 1)])
+    except (IndexError, ValueError):
+        return True, 0.0
+    if price_start <= 0:
+        return True, 0.0
+    abs_ret = (price_end - price_start) / price_start
+    return abs_ret > threshold, abs_ret
 
 
 # ── Backtest engine ───────────────────────────────────────────────────────────
@@ -177,168 +174,175 @@ def eval_exit(
 def run_backtest(
     prices_df:       pd.DataFrame,
     bench:           pd.Series,
+    start:           str,
+    end:             str,
     portfolio_size:  int,
     initial_capital: float,
-    hard_stop:       float,
-    profit_target:   float,
-    composite_floor: float,
-    bear_floor:      float,
-    min_hold_days:   int,
-    cooldown_days:   int,
-    use_regime:      bool,
-    regime_ma:       int   = None,
-    trend_roc:       float = None,
-    trend_ma:        float = None,
+    lookback:        int,
+    skip:            int,
+    abs_threshold:   float,
+    hold_buffer:     int,
+    hard_stop:       float | None,
+    use_abs_filter:  bool,
 ) -> dict:
-    if regime_ma is None:
-        regime_ma = REGIME_MA_PERIOD
-    if trend_roc is None:
-        trend_roc = TREND_BREAK_ROC20
-    if trend_ma is None:
-        trend_ma = TREND_BREAK_MA_PCT
+    required_bars = lookback + skip + 5
+
     cash      = initial_capital
-    holdings  = {}   # symbol → {shares, entry_price, entry_date (Timestamp)}
-    cooldowns = {}   # symbol → exit_date (Timestamp)
+    holdings  = {}   # symbol -> {shares, entry_price, entry_date}
     nav_daily = {}
     trades    = []
 
-    total_days = len(prices_df)
+    # Pre-compute month-end rebalance dates
+    month_ends     = find_month_ends(prices_df.index, start, end)
+    month_end_set  = set(month_ends)
+    total_days     = len(prices_df)
+
+    # Align benchmark index for fast lookup
+    bench_idx_map = (
+        {ts: i for i, ts in enumerate(bench.index)} if bench is not None else {}
+    )
 
     for bar_idx, date in enumerate(prices_df.index):
-        if bar_idx < MIN_HISTORY_BARS:
+
+        # Skip bars before we have enough history
+        if bar_idx < required_bars:
+            nav_daily[date] = initial_capital
+            continue
+
+        # Skip bars before the requested start date
+        if date < pd.Timestamp(start):
+            # Still need to mark-to-market for initial_capital baseline
             nav_daily[date] = initial_capital
             continue
 
         if bar_idx % 60 == 0:
-            logger.info(f"  {bar_idx}/{total_days} bars ({date.date()})…")
+            logger.info(f"  {bar_idx}/{total_days} bars ({date.date()})...")
 
         day_prices = prices_df.iloc[bar_idx]
 
-        # ── Value portfolio ───────────────────────────────────────────────────
+        # ── Daily mark-to-market NAV ──────────────────────────────────────────
         port_value = cash
         for sym, pos in holdings.items():
             p = day_prices.get(sym)
-            if p and not np.isnan(p):
+            if p is not None and not np.isnan(p):
                 port_value += pos["shares"] * p
 
-        # ── Score today ───────────────────────────────────────────────────────
-        scores = score_bar(prices_df, bar_idx)
+        # ── Monthly rebalance on month-end dates only ─────────────────────────
+        if date in month_end_set:
 
-        # ── Regime ───────────────────────────────────────────────────────────
-        bench_idx = (bench.index.get_loc(date)
-                     if (bench is not None and date in bench.index)
-                     else bar_idx)
-        is_bull = regime_bull(bench, bench_idx, regime_ma) if use_regime else True
+            # Bench bar index
+            b_idx = bench_idx_map.get(date, bar_idx)
 
-        # ── Exits ─────────────────────────────────────────────────────────────
-        to_sell = []
-        for sym, pos in list(holdings.items()):
-            cur_p = day_prices.get(sym)
-            if not cur_p or np.isnan(cur_p):
-                to_sell.append((sym, "DATA_GAP"))
-                continue
-            row = scores.loc[sym] if sym in scores.index else None
-            rsn = eval_exit(
-                entry_price     = pos["entry_price"],
-                entry_date      = pos["entry_date"],
-                current_date    = date,
-                current_price   = cur_p,
-                score_row       = row,
-                is_bull         = is_bull,
-                hard_stop       = hard_stop,
-                profit_target   = profit_target,
-                composite_floor = composite_floor,
-                bear_floor      = bear_floor,
-                min_hold_days   = min_hold_days,
-                trend_roc       = trend_roc,
-                trend_ma        = trend_ma,
-            )
-            if rsn:
-                to_sell.append((sym, rsn))
+            # Absolute momentum
+            if use_abs_filter:
+                risk_on, abs_ret = abs_momentum_at_bar(bench, b_idx, lookback, skip, abs_threshold)
+            else:
+                risk_on, abs_ret = True, 0.0
 
-        for sym, rsn in to_sell:
-            cur_p = day_prices.get(sym) or holdings[sym]["entry_price"]
-            if np.isnan(cur_p):
-                cur_p = holdings[sym]["entry_price"]
-            pos      = holdings.pop(sym)
-            proceeds = pos["shares"] * cur_p * (1 - TRANSACTION_COST)
-            cash    += proceeds
-            pnl_inr  = round((cur_p - pos["entry_price"]) * pos["shares"], 2)
-            pnl_pct  = round((cur_p - pos["entry_price"]) / pos["entry_price"] * 100, 2)
-            hold_days = (date - pos["entry_date"]).days
-            trades.append({
-                "date":        date.date().isoformat(),
-                "symbol":      sym,
-                "action":      "SELL",
-                "price":       round(cur_p, 2),
-                "shares":      pos["shares"],
-                "value_inr":   round(proceeds, 0),
-                "entry_price": pos["entry_price"],
-                "hold_days":   hold_days,
-                "reason":      rsn,
-                "composite":   scores.loc[sym, "composite"] if sym in scores.index else 0,
-                "pnl_inr":     pnl_inr,
-                "pnl_pct":     pnl_pct,
-            })
-            cooldowns[sym] = date   # start cooldown clock
+            # Relative momentum ranking
+            scores = rank_at_bar(prices_df, bar_idx, lookback, skip)
 
-        # ── Entries ───────────────────────────────────────────────────────────
-        slots = portfolio_size - len(holdings)
-        if slots > 0 and is_bull and not scores.empty:
-            alloc_each = port_value / portfolio_size
-            eligible = scores[
-                (scores["signal"] == "LONG") &
-                (scores["quality"].isin(ENTRY_QUALITY_FILTER)) &
-                (scores["entry_type"].isin(["GOOD", "OK"]))
-            ]
-            new_buys = []
-            for sym in eligible.index:
-                if len(new_buys) >= slots:
-                    break
-                if sym in holdings:
-                    continue
-                # Cooldown check
-                if sym in cooldowns:
-                    days_since_exit = (date - cooldowns[sym]).days
-                    if days_since_exit < cooldown_days:
-                        continue
-                new_buys.append(sym)
-
-            for sym in new_buys:
+            # ── EXITS ─────────────────────────────────────────────────────────
+            to_sell = []
+            for sym, pos in list(holdings.items()):
                 cur_p = day_prices.get(sym)
-                if not cur_p or np.isnan(cur_p) or cur_p <= 0:
+                if cur_p is None or np.isnan(cur_p):
+                    to_sell.append((sym, "DATA_GAP"))
                     continue
-                cost_ps = cur_p * (1 + TRANSACTION_COST)
-                shares  = int(alloc_each / cost_ps)
-                if shares < 1:
+
+                # Risk-off → sell everything
+                if not risk_on:
+                    to_sell.append((sym, "RISK_OFF"))
                     continue
-                cash -= shares * cost_ps
-                holdings[sym] = {
-                    "shares":      shares,
-                    "entry_price": cur_p,
-                    "entry_date":  date,
-                }
-                cooldowns.pop(sym, None)   # clear stale cooldown
+
+                # Hard stop
+                if hard_stop is not None:
+                    loss_pct = (pos["entry_price"] - cur_p) / pos["entry_price"]
+                    if loss_pct >= hard_stop:
+                        to_sell.append((sym, "HARD_STOP"))
+                        continue
+
+                # Rank exit
+                if sym not in scores.index:
+                    to_sell.append((sym, "NOT_RANKED"))
+                    continue
+
+                if scores.loc[sym, "rank"] > hold_buffer:
+                    to_sell.append((sym, f"RANK_EXIT"))
+                    continue
+
+            for sym, rsn in to_sell:
+                cur_p = day_prices.get(sym)
+                if cur_p is None or np.isnan(cur_p):
+                    cur_p = holdings[sym]["entry_price"]
+                pos      = holdings.pop(sym)
+                proceeds = pos["shares"] * cur_p * (1 - TRANSACTION_COST)
+                cash    += proceeds
+                pnl_inr  = round((cur_p - pos["entry_price"]) * pos["shares"], 2)
+                pnl_pct  = round((cur_p - pos["entry_price"]) / pos["entry_price"] * 100, 2)
+                hold_days = (date - pos["entry_date"]).days
+                mom_ret  = (scores.loc[sym, "momentum_return"]
+                            if sym in scores.index else 0.0)
                 trades.append({
                     "date":        date.date().isoformat(),
                     "symbol":      sym,
-                    "action":      "BUY",
+                    "action":      "SELL",
                     "price":       round(cur_p, 2),
-                    "shares":      shares,
-                    "value_inr":   round(shares * cost_ps, 0),
-                    "entry_price": cur_p,
-                    "hold_days":   0,
-                    "reason":      "SIGNAL_ENTRY",
-                    "composite":   scores.loc[sym, "composite"],
-                    "pnl_inr":     0,
-                    "pnl_pct":     0,
+                    "shares":      pos["shares"],
+                    "value_inr":   round(proceeds, 0),
+                    "entry_price": round(pos["entry_price"], 2),
+                    "hold_days":   hold_days,
+                    "reason":      rsn,
+                    "momentum_return": round(mom_ret, 4),
+                    "rank":        scores.loc[sym, "rank"] if sym in scores.index else 0,
+                    "pnl_inr":     pnl_inr,
+                    "pnl_pct":     pnl_pct,
                 })
+
+            # ── ENTRIES ───────────────────────────────────────────────────────
+            if risk_on and not scores.empty:
+                slots        = portfolio_size - len(holdings)
+                held_symbols = set(holdings.keys())
+                top_ranked   = scores[scores["rank"] <= portfolio_size]
+                candidates   = [s for s in top_ranked.index if s not in held_symbols][:slots]
+
+                for sym in candidates:
+                    cur_p = day_prices.get(sym)
+                    if cur_p is None or np.isnan(cur_p) or cur_p <= 0:
+                        continue
+                    cost_ps = cur_p * (1 + TRANSACTION_COST)
+                    # Equal weight: allocate port_value / portfolio_size per slot
+                    alloc   = port_value / portfolio_size
+                    shares  = int(alloc / cost_ps)
+                    if shares < 1:
+                        continue
+                    cash -= shares * cost_ps
+                    holdings[sym] = {
+                        "shares":      shares,
+                        "entry_price": cur_p,
+                        "entry_date":  date,
+                    }
+                    trades.append({
+                        "date":        date.date().isoformat(),
+                        "symbol":      sym,
+                        "action":      "BUY",
+                        "price":       round(cur_p, 2),
+                        "shares":      shares,
+                        "value_inr":   round(shares * cost_ps, 0),
+                        "entry_price": round(cur_p, 2),
+                        "hold_days":   0,
+                        "reason":      "MOMENTUM_ENTRY",
+                        "momentum_return": round(scores.loc[sym, "momentum_return"], 4),
+                        "rank":        int(scores.loc[sym, "rank"]),
+                        "pnl_inr":     0,
+                        "pnl_pct":     0,
+                    })
 
         # ── Revalue + record NAV ──────────────────────────────────────────────
         port_value = cash
         for sym, pos in holdings.items():
             p = day_prices.get(sym)
-            if p and not np.isnan(p):
+            if p is not None and not np.isnan(p):
                 port_value += pos["shares"] * p
         nav_daily[date] = port_value
 
@@ -353,12 +357,12 @@ def run_backtest(
 def calc_metrics(series: pd.Series, name: str) -> dict:
     if len(series) < 2:
         return {"Strategy": name}
-    ret      = series.pct_change().dropna()
-    n_years  = (series.index[-1] - series.index[0]).days / 365.25
-    total    = (series.iloc[-1] / series.iloc[0]) - 1
-    cagr     = (1 + total) ** (1 / n_years) - 1 if n_years > 0 else 0
-    vol      = ret.std() * np.sqrt(252)
-    sharpe   = (cagr - RISK_FREE_RATE) / vol if vol > 0 else 0
+    ret     = series.pct_change().dropna()
+    n_years = (series.index[-1] - series.index[0]).days / 365.25
+    total   = (series.iloc[-1] / series.iloc[0]) - 1
+    cagr    = (1 + total) ** (1 / n_years) - 1 if n_years > 0 else 0
+    vol     = ret.std() * np.sqrt(252)
+    sharpe  = (cagr - RISK_FREE_RATE) / vol if vol > 0 else 0
     roll_max = series.cummax()
     dd       = (series - roll_max) / roll_max
     max_dd   = dd.min()
@@ -373,7 +377,8 @@ def calc_metrics(series: pd.Series, name: str) -> dict:
         "Sharpe":       f"{sharpe:.2f}",
         "Max Drawdown": f"{max_dd:.1%}",
         "Calmar":       f"{calmar:.2f}",
-        "Monthly Win":  f"{wins}/{len(monthly)} ({wins/len(monthly):.0%})" if len(monthly) else "N/A",
+        "Monthly Win":  (f"{wins}/{len(monthly)} ({wins/len(monthly):.0%})"
+                         if len(monthly) else "N/A"),
     }
 
 
@@ -392,59 +397,66 @@ def print_trade_stats(trades: pd.DataFrame) -> None:
     print(f"  Total BUY trades     : {len(buys)}")
     print(f"  Total SELL trades    : {n}")
     print(f"  Win rate (sells)     : {wins}/{n} ({wins/n:.0%})")
-    print(f"  Total realised P&L   : ₹{total_pnl:+,.0f}")
+    print(f"  Total realised P&L   : Rs{total_pnl:+,.0f}")
     print(f"  Avg hold (days)      : {avg_hold:.1f}")
     print(f"  Exit reason breakdown:")
     for rsn, cnt in reasons.items():
-        print(f"    {rsn:<22}: {cnt}")
-    best  = sells.loc[sells["pnl_inr"].idxmax()]
-    worst = sells.loc[sells["pnl_inr"].idxmin()]
-    print(f"  Best trade           : {best['symbol']} ₹{best['pnl_inr']:+,.0f} ({best['pnl_pct']:+.1f}%) [{best['reason']}]")
-    print(f"  Worst trade          : {worst['symbol']} ₹{worst['pnl_inr']:+,.0f} ({worst['pnl_pct']:+.1f}%) [{worst['reason']}]")
+        pct = cnt / n * 100
+        print(f"    {rsn:<22}: {cnt:>4}  ({pct:.0f}%)")
+    if n > 0:
+        best  = sells.loc[sells["pnl_inr"].idxmax()]
+        worst = sells.loc[sells["pnl_inr"].idxmin()]
+        print(f"  Best trade  : {best['symbol']} Rs{best['pnl_inr']:+,.0f} "
+              f"({best['pnl_pct']:+.1f}%) [{best['reason']}]")
+        print(f"  Worst trade : {worst['symbol']} Rs{worst['pnl_inr']:+,.0f} "
+              f"({worst['pnl_pct']:+.1f}%) [{worst['reason']}]")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Momentum Delivery — Daily Backtest")
-    p.add_argument("--start",          default="2020-01-01")
-    p.add_argument("--end",            default="2024-12-31")
-    p.add_argument("--portfolio-size", default=15,                   type=int)
-    p.add_argument("--capital",        default=INITIAL_CAPITAL,      type=float)
-    p.add_argument("--stop",           default=HARD_STOP_PCT,        type=float)
-    p.add_argument("--target",         default=PROFIT_TARGET_PCT,    type=float)
-    p.add_argument("--floor",          default=EXIT_COMPOSITE_FLOOR, type=float)
-    p.add_argument("--bear-floor",     default=BEAR_COMPOSITE_FLOOR, type=float)
-    p.add_argument("--min-hold",       default=MIN_HOLD_DAYS,        type=int)
-    p.add_argument("--cooldown",       default=REENTRY_COOLDOWN_DAYS,type=int)
-    p.add_argument("--no-regime-filter", action="store_true")
-    p.add_argument("--regime-ma",   default=REGIME_MA_PERIOD,  type=int,
-                   help="Regime MA period in days (default %(default)s)")
-    p.add_argument("--trend-roc",   default=TREND_BREAK_ROC20, type=float,
-                   help="ROC20 threshold for TREND_BREAK exit (default %(default)s%%)")
-    p.add_argument("--trend-ma",    default=TREND_BREAK_MA_PCT, type=float,
-                   help="Price vs 50D MA threshold for TREND_BREAK exit (default %(default)s%%)")
+    p = argparse.ArgumentParser(description="Dual Momentum Delivery — Monthly Backtest")
+    p.add_argument("--start",          default="2018-01-01",
+                   help="Backtest start date (YYYY-MM-DD)")
+    p.add_argument("--end",            default="2024-12-31",
+                   help="Backtest end date (YYYY-MM-DD)")
+    p.add_argument("--portfolio-size", default=TOP_N_HOLD,         type=int,
+                   help=f"Max positions (default {TOP_N_HOLD})")
+    p.add_argument("--capital",        default=INITIAL_CAPITAL,    type=float,
+                   help=f"Initial capital in Rs (default {INITIAL_CAPITAL:,.0f})")
+    p.add_argument("--lookback",       default=MOMENTUM_LOOKBACK_DAYS, type=int,
+                   help=f"Momentum lookback in trading days (default {MOMENTUM_LOOKBACK_DAYS})")
+    p.add_argument("--skip",           default=SKIP_RECENT_DAYS,   type=int,
+                   help=f"Skip-month days (default {SKIP_RECENT_DAYS})")
+    p.add_argument("--abs-threshold",  default=ABSOLUTE_MOMENTUM_THRESHOLD, type=float,
+                   help=f"Absolute momentum threshold (default {ABSOLUTE_MOMENTUM_THRESHOLD})")
+    p.add_argument("--hold-buffer",    default=HOLD_BUFFER,        type=int,
+                   help=f"Sell if rank > this (default {HOLD_BUFFER})")
+    p.add_argument("--hard-stop",      default=HARD_STOP_PCT,      type=float,
+                   help=f"Hard stop fraction e.g. 0.15 (default {HARD_STOP_PCT})")
+    p.add_argument("--no-abs-filter",  action="store_true",
+                   help="Disable absolute momentum filter (pure relative momentum)")
     return p.parse_args()
 
 
 def main():
     args       = parse_args()
-    use_regime = not args.no_regime_filter
-    sep = "=" * 68
+    use_abs    = not args.no_abs_filter
+    hard_stop  = args.hard_stop if args.hard_stop and args.hard_stop > 0 else None
+    sep        = "=" * 68
 
     print(sep)
-    print("  MOMENTUM DELIVERY BOT — DAILY SIGNAL BACKTEST")
-    print(f"  Period          : {args.start}  →  {args.end}")
+    print("  DUAL MOMENTUM DELIVERY BOT — MONTHLY BACKTEST")
+    print(f"  Period          : {args.start}  ->  {args.end}")
     print(f"  Universe        : Nifty 200 ({len(NIFTY200_UNIVERSE)} stocks)")
-    print(f"  Portfolio size  : {args.portfolio_size} (equal-weight slots)")
-    print(f"  Entry filter    : {', '.join(ENTRY_QUALITY_FILTER)} signals, GOOD or OK entry")
-    print(f"  Hard stop       : {args.stop:.0%}  |  Profit target : {args.target:.0%}")
-    print(f"  Composite floor : {args.floor} (bull)  /  {args.bear_floor} (bear)")
-    print(f"  Min hold days   : {args.min_hold}  |  Cooldown : {args.cooldown} days")
-    print(f"  Regime filter   : {'ON (Nifty ' + str(args.regime_ma) + 'D MA)' if use_regime else 'OFF'}")
-    print(f"  Trend break     : ROC20 < {args.trend_roc}%  AND  vs_MA50 < {args.trend_ma}%")
-    print(f"  Transaction cost: {TRANSACTION_COST*100:.2f}% per trade")
-    print(f"  Initial capital : ₹{args.capital:,.0f}")
+    print(f"  Portfolio size  : {args.portfolio_size} equal-weight slots")
+    print(f"  Lookback        : {args.lookback} days (~12 months)")
+    print(f"  Skip recent     : {args.skip} days (~1 month, avoids reversal)")
+    print(f"  Abs. momentum   : {'ON — threshold ' + str(args.abs_threshold) if use_abs else 'OFF (pure relative)'}")
+    print(f"  Hold buffer     : sell if rank > {args.hold_buffer}")
+    print(f"  Hard stop       : {hard_stop:.0%}" if hard_stop else "  Hard stop       : OFF")
+    print(f"  Transaction cost: {TRANSACTION_COST*100:.2f}% per trade (one-way)")
+    print(f"  Initial capital : Rs{args.capital:,.0f}")
     print(sep)
 
     prices_df, bench = download_prices(NIFTY200_UNIVERSE, args.start, args.end)
@@ -452,25 +464,26 @@ def main():
         logger.error("No price data. Exiting.")
         sys.exit(1)
 
-    logger.info(f"Running daily scan over {len(prices_df)} trading days…")
+    logger.info(f"Running monthly rebalances from {args.start} to {args.end}...")
     result = run_backtest(
         prices_df       = prices_df,
         bench           = bench,
+        start           = args.start,
+        end             = args.end,
         portfolio_size  = args.portfolio_size,
         initial_capital = args.capital,
-        hard_stop       = args.stop,
-        profit_target   = args.target,
-        composite_floor = args.floor,
-        bear_floor      = args.bear_floor,
-        min_hold_days   = args.min_hold,
-        cooldown_days   = args.cooldown,
-        use_regime      = use_regime,
-        regime_ma       = args.regime_ma,
-        trend_roc       = args.trend_roc,
-        trend_ma        = args.trend_ma,
+        lookback        = args.lookback,
+        skip            = args.skip,
+        abs_threshold   = args.abs_threshold,
+        hold_buffer     = args.hold_buffer,
+        hard_stop       = hard_stop,
+        use_abs_filter  = use_abs,
     )
     nav    = result["nav"]
     trades = result["trades"]
+
+    # ── Trim NAV to requested date range ─────────────────────────────────────
+    nav = nav[nav.index >= pd.Timestamp(args.start)]
 
     # ── Benchmark ─────────────────────────────────────────────────────────────
     bench_aligned = None
@@ -480,8 +493,8 @@ def main():
             bv = bench.reindex(bd).dropna()
             bench_aligned = bv / bv.iloc[0] * args.capital
 
-    # ── Metrics ───────────────────────────────────────────────────────────────
-    sm = calc_metrics(nav, "Momentum Delivery (Daily)")
+    # ── Strategy metrics ──────────────────────────────────────────────────────
+    sm = calc_metrics(nav, "Dual Momentum (Monthly)")
     bm = calc_metrics(bench_aligned, "Nifty 50 (Benchmark)") if bench_aligned is not None else None
 
     print(f"\n{sep}")
@@ -517,18 +530,24 @@ def main():
                 a_str = f"{sr - br:+.1%}"
         print(f"  {yr:<8} {sr:>+12.1%} {b_str:>12} {a_str:>10}")
 
-    # ── Trade stats ───────────────────────────────────────────────────────────
-    print(f"\n{sep}")
-    print("  TRADE STATISTICS")
-    print(sep)
-    print_trade_stats(trades)
+    # ── Regime periods summary ────────────────────────────────────────────────
+    if not trades.empty:
+        risk_off_months = trades[trades["reason"] == "RISK_OFF"]["date"].nunique()
+        print(f"\n{sep}")
+        print("  TRADE STATISTICS")
+        print(sep)
+        print_trade_stats(trades)
+        if risk_off_months:
+            print(f"\n  Risk-off months (all-cash): ~{risk_off_months}")
 
-    # ── Save ──────────────────────────────────────────────────────────────────
-    nav.reset_index().rename(columns={"index": "date", 0: "nav"}).to_csv(
-        "backtest_results.csv", index=False
-    )
+    # ── Save outputs ──────────────────────────────────────────────────────────
+    nav_df = nav.reset_index()
+    nav_df.columns = ["date", "nav"]
+    nav_df.to_csv("backtest_results.csv", index=False)
+
     if not trades.empty:
         trades.to_csv("backtest_trades.csv", index=False)
+
     rows = [sm]
     if bm:
         rows.append(bm)

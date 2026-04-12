@@ -1,53 +1,52 @@
 """
 portfolio_state.py
 ------------------
-Persists open delivery positions AND re-entry cooldowns across daily runs.
+Persists open delivery positions across monthly rebalances.
 
-Two CSV files are committed to the repo after every scan:
-  positions.csv  — current open positions
-  cooldown.csv   — symbols recently exited (blocks re-entry for N days)
+Single CSV file committed to the repo after every rebalance:
+  positions.csv  — current open positions with entry metadata
+
+No cooldown tracking — Dual Momentum has no re-entry gate.
+Stocks exit because they fell out of the top-ranked tier, and
+they re-enter the next month if they rank highly again.
 """
 
 import csv
 import logging
-from dataclasses import dataclass, asdict
-from datetime import date, timedelta
+from dataclasses import asdict, dataclass
+from datetime import date
 from pathlib import Path
 
-from config import COOLDOWN_FILE, POSITIONS_FILE, REENTRY_COOLDOWN_DAYS
+from config import POSITIONS_FILE
 
 logger = logging.getLogger(__name__)
 
 _POS_FIELDS = [
     "symbol", "entry_date", "entry_price", "quantity",
-    "composite_at_entry", "quality_at_entry", "entry_type",
+    "momentum_return_at_entry", "rank_at_entry",
 ]
-_CD_FIELDS = ["symbol", "exit_date"]
 
 
 @dataclass
 class DeliveryPosition:
-    symbol:             str
-    entry_date:         str     # "YYYY-MM-DD"
-    entry_price:        float
-    quantity:           int
-    composite_at_entry: float
-    quality_at_entry:   str
-    entry_type:         str
+    symbol:                   str
+    entry_date:               str     # "YYYY-MM-DD"
+    entry_price:              float
+    quantity:                 int
+    momentum_return_at_entry: float   # 12M-1M return on the month we bought
+    rank_at_entry:            int     # Rank in universe on the month we bought
 
 
 class PortfolioState:
-    """Loads and saves open positions + re-entry cooldowns."""
+    """Loads and saves open positions from/to positions.csv."""
 
     def __init__(self) -> None:
         self._positions: dict[str, DeliveryPosition] = {}
-        self._cooldowns: dict[str, date] = {}          # symbol → exit_date
-        self._load_positions()
-        self._load_cooldowns()
+        self._load()
 
-    # ── Persistence ───────────────────────────────────────────────────────
+    # ── Persistence ───────────────────────────────────────────────────────────
 
-    def _load_positions(self) -> None:
+    def _load(self) -> None:
         path = Path(POSITIONS_FILE)
         if not path.exists():
             logger.info(f"{POSITIONS_FILE} not found — starting with empty portfolio.")
@@ -57,61 +56,32 @@ class PortfolioState:
                 if not row.get("symbol"):
                     continue
                 pos = DeliveryPosition(
-                    symbol             = row["symbol"],
-                    entry_date         = row["entry_date"],
-                    entry_price        = float(row["entry_price"]),
-                    quantity           = int(row["quantity"]),
-                    composite_at_entry = float(row["composite_at_entry"]),
-                    quality_at_entry   = row["quality_at_entry"],
-                    entry_type         = row["entry_type"],
+                    symbol                   = row["symbol"],
+                    entry_date               = row["entry_date"],
+                    entry_price              = float(row["entry_price"]),
+                    quantity                 = int(row["quantity"]),
+                    momentum_return_at_entry = float(row["momentum_return_at_entry"]),
+                    rank_at_entry            = int(row["rank_at_entry"]),
                 )
                 self._positions[pos.symbol] = pos
         logger.info(f"Loaded {len(self._positions)} open positions from {POSITIONS_FILE}")
 
-    def _load_cooldowns(self) -> None:
-        path = Path(COOLDOWN_FILE)
-        if not path.exists():
-            return
-        today = date.today()
-        with open(path, newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                if not row.get("symbol"):
-                    continue
-                exit_dt = date.fromisoformat(row["exit_date"])
-                # Only keep cooldowns that haven't expired yet
-                if (today - exit_dt).days < REENTRY_COOLDOWN_DAYS:
-                    self._cooldowns[row["symbol"]] = exit_dt
-        logger.info(f"Loaded {len(self._cooldowns)} active cooldowns from {COOLDOWN_FILE}")
-
     def save(self) -> None:
-        """Write positions and cooldowns to CSV (overwrite both files)."""
+        """Overwrite positions.csv with current state."""
         with open(POSITIONS_FILE, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=_POS_FIELDS)
             writer.writeheader()
             for pos in self._positions.values():
                 writer.writerow(asdict(pos))
+        logger.info(f"Saved {len(self._positions)} open positions to {POSITIONS_FILE}")
 
-        # Prune expired cooldowns before saving
-        today = date.today()
-        active = {s: d for s, d in self._cooldowns.items()
-                  if (today - d).days < REENTRY_COOLDOWN_DAYS}
-        self._cooldowns = active
-
-        with open(COOLDOWN_FILE, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=_CD_FIELDS)
-            writer.writeheader()
-            for sym, dt in self._cooldowns.items():
-                writer.writerow({"symbol": sym, "exit_date": dt.isoformat()})
-
-        logger.info(
-            f"Saved {len(self._positions)} positions | "
-            f"{len(self._cooldowns)} active cooldowns"
-        )
-
-    # ── Position queries ──────────────────────────────────────────────────
+    # ── Queries ───────────────────────────────────────────────────────────────
 
     def all(self) -> list[DeliveryPosition]:
         return list(self._positions.values())
+
+    def symbols(self) -> set[str]:
+        return set(self._positions.keys())
 
     def has(self, symbol: str) -> bool:
         return symbol in self._positions
@@ -122,78 +92,51 @@ class PortfolioState:
     def count(self) -> int:
         return len(self._positions)
 
-    # ── Cooldown queries ──────────────────────────────────────────────────
-
-    def is_on_cooldown(self, symbol: str) -> bool:
-        """True if this symbol was exited recently and cannot be re-entered yet."""
-        if symbol not in self._cooldowns:
-            return False
-        days_since_exit = (date.today() - self._cooldowns[symbol]).days
-        return days_since_exit < REENTRY_COOLDOWN_DAYS
-
-    def cooldown_days_remaining(self, symbol: str) -> int:
-        if symbol not in self._cooldowns:
-            return 0
-        elapsed = (date.today() - self._cooldowns[symbol]).days
-        return max(0, REENTRY_COOLDOWN_DAYS - elapsed)
-
-    # ── Mutations ─────────────────────────────────────────────────────────
+    # ── Mutations ─────────────────────────────────────────────────────────────
 
     def add(
         self,
-        symbol:             str,
-        entry_price:        float,
-        quantity:           int,
-        composite_at_entry: float,
-        quality_at_entry:   str,
-        entry_type:         str,
+        symbol:                   str,
+        entry_price:              float,
+        quantity:                 int,
+        momentum_return_at_entry: float,
+        rank_at_entry:            int,
     ) -> None:
         self._positions[symbol] = DeliveryPosition(
-            symbol             = symbol,
-            entry_date         = date.today().isoformat(),
-            entry_price        = round(entry_price, 2),
-            quantity           = quantity,
-            composite_at_entry = round(composite_at_entry, 3),
-            quality_at_entry   = quality_at_entry,
-            entry_type         = entry_type,
+            symbol                   = symbol,
+            entry_date               = date.today().isoformat(),
+            entry_price              = round(entry_price, 2),
+            quantity                 = quantity,
+            momentum_return_at_entry = round(momentum_return_at_entry, 4),
+            rank_at_entry            = rank_at_entry,
         )
-        # Clear any stale cooldown for this symbol (we just bought it)
-        self._cooldowns.pop(symbol, None)
         logger.info(
-            f"[PORTFOLIO] +ADD {symbol} | qty={quantity} @ ₹{entry_price:.2f} "
-            f"composite={composite_at_entry:.2f} [{quality_at_entry}]"
+            f"[PORTFOLIO] +BUY  {symbol:<14} qty={quantity} @ Rs{entry_price:.2f}  "
+            f"12M-1M={momentum_return_at_entry:+.1%}  rank=#{rank_at_entry}"
         )
 
     def remove(self, symbol: str) -> DeliveryPosition | None:
         pos = self._positions.pop(symbol, None)
         if pos:
-            # Record exit date for re-entry cooldown
-            self._cooldowns[symbol] = date.today()
-            logger.info(
-                f"[PORTFOLIO] -REMOVE {symbol} | "
-                f"cooldown until {(date.today() + timedelta(days=REENTRY_COOLDOWN_DAYS)).isoformat()}"
-            )
+            logger.info(f"[PORTFOLIO] -SELL {symbol:<14} (removed from portfolio)")
         return pos
+
+    # ── Display ───────────────────────────────────────────────────────────────
 
     def summary(self) -> str:
         lines = []
+        today = date.today()
         if not self._positions:
-            lines.append("Portfolio: empty")
+            lines.append("Portfolio: empty (all cash)")
         else:
             lines.append(f"Open positions ({self.count()}):")
-            today = date.today()
-            for p in self._positions.values():
+            for p in sorted(self._positions.values(),
+                            key=lambda x: x.momentum_return_at_entry, reverse=True):
                 entry_dt  = date.fromisoformat(p.entry_date)
                 days_held = (today - entry_dt).days
                 lines.append(
                     f"  {p.symbol:<14} qty={p.quantity:<5} "
-                    f"entry=₹{p.entry_price:,.2f}  held={days_held}d  "
-                    f"composite={p.composite_at_entry:.2f}  [{p.quality_at_entry}]"
+                    f"entry=Rs{p.entry_price:,.2f}  held={days_held}d  "
+                    f"12M-1M={p.momentum_return_at_entry:+.1%}  rank=#{p.rank_at_entry}"
                 )
-        if self._cooldowns:
-            lines.append(f"On cooldown ({len(self._cooldowns)}): "
-                         + ", ".join(
-                             f"{s}({self.cooldown_days_remaining(s)}d)"
-                             for s in self._cooldowns
-                         ))
         return "\n".join(lines)

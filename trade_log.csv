@@ -1,1 +1,1 @@
-date,symbol,action,price,quantity,value_inr,reason,composite_score,quality,pnl_inr,pnl_pct
+date,symbol,action,price,quantity,value_inr,reason,momentum_return,rank,pnl_inr,pnl_pct

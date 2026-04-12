@@ -1,22 +1,24 @@
 """
 main.py
 -------
-Momentum Delivery Bot — Daily Signal Scan.
-Run manually at ~3 PM IST each trading day via GitHub Actions.
+Dual Momentum Delivery Bot — Monthly Rebalance.
+Run on the LAST TRADING DAY of each month via GitHub Actions (manual trigger).
 
-Exit rules (signal-driven, evaluated in this order):
-  1. Hard stop    — down ≥ 6% from entry              [always active, even day 1]
-  2. Profit target— up  ≥ 18% from entry              [always active]
-  3. Momentum fade— composite < floor                 [after MIN_HOLD_DAYS]
-                    floor = 2.5 in bear regime, 1.5 in bull
-  4. Trend break  — ROC20 < -3% AND price < 50D MA by >3%  [after MIN_HOLD_DAYS]
-  (SIGNAL_SHORT removed — MOMENTUM_FADE at 1.5 covers composite-based exits cleanly)
+Strategy (Gary Antonacci's Dual Momentum, Nifty 200 adaptation):
 
-Entry rules:
-  • STRONG signal only (no MODERATE)
-  • GOOD or OK entry type (not CHASE)
-  • Not already held + slot available + bull regime
-  • Not on re-entry cooldown (15 days after last exit)
+  STEP 1 — ABSOLUTE MOMENTUM CHECK:
+    Is Nifty 50's 12-month return (excluding last 21 days) > 6%?
+    -> NO:   Sell ALL open positions. Stay in cash. Re-check next month.
+    -> YES:  Proceed to relative momentum.
+
+  STEP 2 — RELATIVE MOMENTUM (cross-sectional):
+    Rank all Nifty 200 stocks by their 12M-1M return.
+    SELL: holdings that have dropped below rank HOLD_BUFFER (20).
+    BUY:  top TOP_N_HOLD (15) stocks not already held, filling vacant slots.
+
+  RISK VALVE (monthly hard stop — safety net, not part of original DM):
+    Also sell any position down > HARD_STOP_PCT (15%) from entry price.
+    Protects against individual stock blow-ups between monthly rebalances.
 """
 
 import logging
@@ -26,20 +28,15 @@ from datetime import date, datetime
 import pytz
 
 from config import (
-    BEAR_COMPOSITE_FLOOR,
-    ENTRY_QUALITY_FILTER,
-    EXIT_COMPOSITE_FLOOR,
     HARD_STOP_PCT,
+    HOLD_BUFFER,
     MARKET_REGIME_FILTER,
-    MIN_HOLD_DAYS,
     PORTFOLIO_SIZE,
     POSITION_SIZE_INR,
-    PROFIT_TARGET_PCT,
-    TREND_BREAK_MA_PCT,
-    TREND_BREAK_ROC20,
+    TOP_N_HOLD,
 )
-from data_feed import fetch_universe_prices, get_regime_signal
-from momentum_scorer import MomentumScore, print_ranked_table, rank_universe
+from data_feed import fetch_universe_prices, get_absolute_momentum
+from momentum_scorer import MomentumRank, print_ranked_table, rank_universe
 from order_manager import buy_delivery, calculate_quantity, sell_delivery
 from portfolio_state import DeliveryPosition, PortfolioState
 from trade_logger import log_buy, log_sell, print_session_summary
@@ -58,95 +55,44 @@ def ist_now() -> datetime:
 
 
 # ---------------------------------------------------------------------------
-# Exit logic
+# Exit evaluation
 # ---------------------------------------------------------------------------
 
 def check_exit_reason(
-    pos:        DeliveryPosition,
-    score:      MomentumScore | None,
-    bull_regime: bool,
+    pos:      DeliveryPosition,
+    rank_map: dict[str, MomentumRank],
+    risk_on:  bool,
 ) -> str | None:
     """
-    Evaluate all exit criteria for one held position.
-    Returns a reason string to sell, or None to keep holding.
+    Return an exit reason string if this position should be sold, else None.
+
+    Exit triggers (in priority order):
+      1. RISK_OFF     — absolute momentum failed; sell everything
+      2. HARD_STOP    — position down >15% from entry (monthly safety check)
+      3. RANK_EXIT    — stock dropped below HOLD_BUFFER rank
+      4. NOT_RANKED   — stock dropped out of scoreable universe
     """
-    if score is None:
-        return "DATA_GAP"
+    # 1. Absolute momentum failed — global risk-off, sell all
+    if not risk_on:
+        return "RISK_OFF"
 
-    cur_price   = score.current_price
-    entry_price = pos.entry_price
-    days_held   = (date.today() - date.fromisoformat(pos.entry_date)).days
+    cur = rank_map.get(pos.symbol)
 
-    loss_pct = (entry_price - cur_price) / entry_price
-    gain_pct = (cur_price - entry_price) / entry_price
+    # 2. Stock no longer scoreable (too little data, delisted, etc.)
+    if cur is None:
+        return "NOT_RANKED"
 
-    # ── Always active (even on day 1) ──────────────────────────────────────
-    if loss_pct >= HARD_STOP_PCT:
-        return f"HARD_STOP({loss_pct:.1%})"
+    # 3. Hard stop — individual position down >15% from entry
+    if HARD_STOP_PCT is not None:
+        loss_pct = (pos.entry_price - cur.current_price) / pos.entry_price
+        if loss_pct >= HARD_STOP_PCT:
+            return f"HARD_STOP({loss_pct:.1%})"
 
-    if gain_pct >= PROFIT_TARGET_PCT:
-        return f"PROFIT_TARGET({gain_pct:.1%})"
+    # 4. Rank has fallen below the hold buffer
+    if cur.rank > HOLD_BUFFER:
+        return f"RANK_EXIT(rank={cur.rank})"
 
-    # ── Soft exits — only after minimum hold period ────────────────────────
-    if days_held < MIN_HOLD_DAYS:
-        return None   # too early to judge trend/momentum signals
-
-    # Bear regime uses a tighter composite floor (exit faster when macro weak)
-    floor = EXIT_COMPOSITE_FLOOR if bull_regime else BEAR_COMPOSITE_FLOOR
-    if score.composite < floor:
-        return f"MOMENTUM_FADE(composite={score.composite:.2f},floor={floor})"
-
-    if score.roc20 < TREND_BREAK_ROC20 and score.price_vs_ma50 < TREND_BREAK_MA_PCT:
-        return f"TREND_BREAK(roc20={score.roc20:.1f}%,vs_ma={score.price_vs_ma50:.1f}%)"
-
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Entry logic
-# ---------------------------------------------------------------------------
-
-def get_entry_candidates(
-    ranked:      list[MomentumScore],
-    portfolio:   PortfolioState,
-    bull_regime: bool,
-) -> list[MomentumScore]:
-    """
-    Return new stocks to buy:
-    - STRONG signal only
-    - GOOD or OK entry type (not CHASE)
-    - Not already held
-    - Not on re-entry cooldown
-    - Fill up to PORTFOLIO_SIZE slots
-    """
-    if not bull_regime:
-        logger.info("Bear regime — no new buys.")
-        return []
-
-    slots = PORTFOLIO_SIZE - portfolio.count()
-    if slots <= 0:
-        logger.info("Portfolio full — no new buys.")
-        return []
-
-    candidates = []
-    for s in ranked:
-        if len(candidates) >= slots:
-            break
-        if s.signal != "LONG":
-            continue
-        if s.quality not in ENTRY_QUALITY_FILTER:
-            continue
-        if s.entry_type not in ("GOOD", "OK"):
-            continue
-        if portfolio.has(s.symbol):
-            continue
-        if portfolio.is_on_cooldown(s.symbol):
-            remaining = portfolio.cooldown_days_remaining(s.symbol)
-            logger.info(f"  SKIP {s.symbol} — cooldown ({remaining}d remaining)")
-            continue
-        candidates.append(s)
-
-    return candidates
+    return None   # keep holding
 
 
 # ---------------------------------------------------------------------------
@@ -155,76 +101,85 @@ def get_entry_candidates(
 
 def run() -> None:
     now = ist_now()
-    composite_floor = EXIT_COMPOSITE_FLOOR  # will be overridden per position if bear
 
-    logger.info("=" * 66)
-    logger.info("  MOMENTUM DELIVERY BOT — DAILY SIGNAL SCAN")
-    logger.info(f"  Run time    : {now.strftime('%Y-%m-%d %H:%M:%S IST')}")
-    logger.info(f"  Portfolio   : up to {PORTFOLIO_SIZE} stocks | ₹{POSITION_SIZE_INR:,.0f}/stock")
-    logger.info(f"  Entry filter: {', '.join(ENTRY_QUALITY_FILTER)} signals only")
-    logger.info(f"  Hard stop   : {HARD_STOP_PCT:.0%}  |  Target : {PROFIT_TARGET_PCT:.0%}")
-    logger.info(f"  Min hold    : {MIN_HOLD_DAYS} days  |  Cooldown: {15} days after exit")
-    logger.info(f"  Bear floor  : {BEAR_COMPOSITE_FLOOR} (vs {EXIT_COMPOSITE_FLOOR} in bull)")
-    logger.info("=" * 66)
+    sep = "=" * 66
+    logger.info(sep)
+    logger.info("  DUAL MOMENTUM DELIVERY BOT — MONTHLY REBALANCE")
+    logger.info(f"  Run time     : {now.strftime('%Y-%m-%d %H:%M:%S IST')}")
+    logger.info(f"  Strategy     : Dual Momentum (Antonacci) — Nifty 200")
+    logger.info(f"  Lookback     : 12M-1M (252 days, skip 21 days)")
+    logger.info(f"  Portfolio    : top {TOP_N_HOLD} stocks | Rs{POSITION_SIZE_INR:,.0f}/slot")
+    logger.info(f"  Hold buffer  : sell if rank > {HOLD_BUFFER}")
+    logger.info(f"  Hard stop    : {HARD_STOP_PCT:.0%} from entry (monthly check)")
+    logger.info(sep)
 
     # ── 1. Price data ─────────────────────────────────────────────────────────
-    logger.info("\n[1/5] Downloading price history…")
+    logger.info("\n[1/5] Downloading price history (3y)...")
     prices_df = fetch_universe_prices()
     if prices_df.empty:
         logger.error("Price download failed. Aborting.")
         sys.exit(1)
 
-    # ── 2. Market regime ──────────────────────────────────────────────────────
-    logger.info("\n[2/5] Checking market regime…")
-    bull_regime = get_regime_signal() if MARKET_REGIME_FILTER else True
+    # ── 2. Absolute momentum check ────────────────────────────────────────────
+    logger.info("\n[2/5] Absolute momentum check (Nifty 50 12M-1M vs 6%)...")
+    if MARKET_REGIME_FILTER:
+        risk_on, abs_return = get_absolute_momentum()
+    else:
+        risk_on, abs_return = True, 0.0
+        logger.info("  Regime filter disabled — treating as RISK-ON.")
 
-    # ── 3. Score universe ─────────────────────────────────────────────────────
-    logger.info("\n[3/5] Scoring and ranking Nifty 200 universe…")
+    # ── 3. Rank universe ──────────────────────────────────────────────────────
+    logger.info("\n[3/5] Ranking Nifty 200 by 12M-1M momentum...")
     ranked   = rank_universe(prices_df)
-    rank_map = {s.symbol: s for s in ranked}
+    rank_map = {r.symbol: r for r in ranked}
     print_ranked_table(ranked, top_n=25)
 
+    if risk_on:
+        logger.info(f"\n  RISK-ON: Nifty 12M-1M = {abs_return:+.1%} > 6% threshold")
+        logger.info(f"  Holding targets: top {TOP_N_HOLD} stocks (sell if rank > {HOLD_BUFFER})")
+    else:
+        logger.info(f"\n  RISK-OFF: Nifty 12M-1M = {abs_return:+.1%} <= 6% threshold")
+        logger.info("  Selling ALL positions — moving to cash until next month.")
+
     # ── 4. Load portfolio ─────────────────────────────────────────────────────
-    logger.info("\n[4/5] Loading current portfolio…")
+    logger.info("\n[4/5] Loading current portfolio...")
     portfolio = PortfolioState()
     logger.info(portfolio.summary())
 
-    # ── 5. Scan ───────────────────────────────────────────────────────────────
-    logger.info("\n[5/5] Scanning exits then entries…")
-    session_sells = []
-    session_buys  = []
+    # ── 5. Rebalance ──────────────────────────────────────────────────────────
+    logger.info("\n[5/5] Rebalancing...")
+    session_sells: list[dict] = []
+    session_buys:  list[dict] = []
 
     # ── EXITS ─────────────────────────────────────────────────────────────────
     for pos in portfolio.all():
-        score  = rank_map.get(pos.symbol)
-        reason = check_exit_reason(pos, score, bull_regime)
-
-        days_held = (date.today() - date.fromisoformat(pos.entry_date)).days
+        reason = check_exit_reason(pos, rank_map, risk_on)
 
         if reason is None:
-            gain_loss = (
-                (score.current_price - pos.entry_price) / pos.entry_price
-                if score else 0.0
-            )
+            cur   = rank_map[pos.symbol]
+            gain  = (cur.current_price - pos.entry_price) / pos.entry_price
             logger.info(
-                f"  HOLD {pos.symbol:<14} "
-                f"composite={score.composite:.2f}  "
-                f"held={days_held}d  "
-                f"P&L={gain_loss:+.1%}"
+                f"  HOLD {pos.symbol:<14} rank=#{cur.rank:<4} "
+                f"12M-1M={cur.momentum_return:+.1%}  unrealised={gain:+.1%}"
             )
             continue
 
-        cur_price = score.current_price if score else pos.entry_price
+        # Determine exit price
+        cur       = rank_map.get(pos.symbol)
+        cur_price = cur.current_price if cur else pos.entry_price
+        mom_ret   = cur.momentum_return if cur else pos.momentum_return_at_entry
+        cur_rank  = cur.rank if cur else 0
+
         ok = sell_delivery(pos.symbol, pos.quantity)
         if ok:
             log_sell(
-                symbol      = pos.symbol,
-                price       = cur_price,
-                quantity    = pos.quantity,
-                entry_price = pos.entry_price,
-                composite   = score.composite if score else 0.0,
-                quality     = score.quality   if score else "N/A",
-                reason      = reason,
+                symbol          = pos.symbol,
+                price           = cur_price,
+                quantity        = pos.quantity,
+                entry_price     = pos.entry_price,
+                momentum_return = mom_ret,
+                rank            = cur_rank,
+                reason          = reason,
             )
             session_sells.append({
                 "symbol":      pos.symbol,
@@ -235,71 +190,77 @@ def run() -> None:
                 "pnl_pct":     round((cur_price - pos.entry_price) / pos.entry_price * 100, 2),
                 "reason":      reason,
             })
-            portfolio.remove(pos.symbol)   # also records cooldown
+            portfolio.remove(pos.symbol)
         else:
             logger.error(f"  SELL FAILED {pos.symbol} — keeping in portfolio.")
 
-    # ── ENTRIES ───────────────────────────────────────────────────────────────
-    entries = get_entry_candidates(ranked, portfolio, bull_regime)
-
-    if not entries:
-        logger.info("  No new entries today.")
+    # ── ENTRIES (only if risk-on) ─────────────────────────────────────────────
+    if not risk_on:
+        logger.info("  RISK-OFF — no new buys this month.")
     else:
-        logger.info(f"  {len(entries)} new entry candidate(s):")
-        for s in entries:
-            logger.info(
-                f"    ↑ {s.symbol:<14} composite={s.composite:.2f}  "
-                f"accel={s.acceleration:.2f}  [{s.quality}]  entry_type={s.entry_type}"
-            )
+        slots = TOP_N_HOLD - portfolio.count()
+        held  = portfolio.symbols()
 
-    for score in entries:
-        qty = calculate_quantity(score.current_price)
-        if qty < 1:
-            logger.warning(
-                f"  {score.symbol}: ₹{score.current_price:.2f} too high for "
-                f"₹{POSITION_SIZE_INR:,.0f} allocation, skipping."
-            )
-            continue
+        # Candidates: top TOP_N_HOLD by rank, not already held
+        candidates = [r for r in ranked[:TOP_N_HOLD] if r.symbol not in held][:slots]
 
-        ok = buy_delivery(score.symbol, qty)
-        if ok:
-            log_buy(
-                symbol    = score.symbol,
-                price     = score.current_price,
-                quantity  = qty,
-                composite = score.composite,
-                quality   = score.quality,
-            )
-            portfolio.add(
-                symbol             = score.symbol,
-                entry_price        = score.current_price,
-                quantity           = qty,
-                composite_at_entry = score.composite,
-                quality_at_entry   = score.quality,
-                entry_type         = score.entry_type,
-            )
-            session_buys.append({
-                "symbol":    score.symbol,
-                "price":     score.current_price,
-                "quantity":  qty,
-                "composite": score.composite,
-                "quality":   score.quality,
-            })
+        if not candidates:
+            logger.info("  No new entries — portfolio already at capacity or no candidates.")
         else:
-            logger.error(f"  BUY FAILED {score.symbol}.")
+            logger.info(f"  {len(candidates)} new entry candidate(s):")
+            for r in candidates:
+                logger.info(
+                    f"    ^ {r.symbol:<14} rank=#{r.rank:<4} "
+                    f"12M-1M={r.momentum_return:+.1%}  price=Rs{r.current_price:.2f}"
+                )
 
-    # ── Save ──────────────────────────────────────────────────────────────────
+        for r in candidates:
+            qty = calculate_quantity(r.current_price)
+            if qty < 1:
+                logger.warning(
+                    f"  {r.symbol}: price Rs{r.current_price:.2f} too high "
+                    f"for Rs{POSITION_SIZE_INR:,.0f} allocation — skipping."
+                )
+                continue
+
+            ok = buy_delivery(r.symbol, qty)
+            if ok:
+                log_buy(
+                    symbol          = r.symbol,
+                    price           = r.current_price,
+                    quantity        = qty,
+                    momentum_return = r.momentum_return,
+                    rank            = r.rank,
+                )
+                portfolio.add(
+                    symbol                   = r.symbol,
+                    entry_price              = r.current_price,
+                    quantity                 = qty,
+                    momentum_return_at_entry = r.momentum_return,
+                    rank_at_entry            = r.rank,
+                )
+                session_buys.append({
+                    "symbol":          r.symbol,
+                    "price":           r.current_price,
+                    "quantity":        qty,
+                    "momentum_return": r.momentum_return,
+                    "rank":            r.rank,
+                })
+            else:
+                logger.error(f"  BUY FAILED {r.symbol}.")
+
+    # ── Save state ────────────────────────────────────────────────────────────
     portfolio.save()
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print_session_summary(session_buys, session_sells)
-    logger.info("\nPortfolio after today's scan:")
+    logger.info("\nPortfolio after rebalance:")
     logger.info(portfolio.summary())
 
     if not session_sells and not session_buys:
-        logger.info("\nNo trades today — portfolio unchanged.")
+        logger.info("\nNo trades this month — portfolio unchanged.")
 
-    logger.info("\nDone. positions.csv, cooldown.csv and trade_log.csv committed by workflow.")
+    logger.info("\nDone. positions.csv and trade_log.csv committed by workflow.")
 
 
 if __name__ == "__main__":

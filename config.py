@@ -1,8 +1,12 @@
 """
 config.py
 ---------
-All configuration for the Momentum Rotation Delivery Bot.
-Mirrors the structure of the intraday bot's config.py.
+Dual Momentum Delivery Bot — Configuration.
+
+Strategy: Gary Antonacci's Dual Momentum, adapted for Nifty 200.
+  1. Absolute momentum  — Nifty 50 12M-1M return > 6% → risk-on, else → cash
+  2. Relative momentum  — buy top 15 Nifty 200 stocks by 12M-1M return
+  Rebalance: monthly (last trading day of each month)
 """
 
 import os
@@ -64,84 +68,48 @@ NIFTY200_UNIVERSE = [
 ]
 
 # ---------------------------------------------------------------------------
-# Momentum Scoring Parameters  (from Excel framework)
+# Dual Momentum Parameters
 # ---------------------------------------------------------------------------
-MIN_COMPOSITE_SCORE    = 2.0    # Minimum composite score for LONG signal
-PORTFOLIO_SIZE         = 15     # Max simultaneous open delivery positions
-MIN_HISTORY_BARS       = 110    # Minimum daily bars needed to score a stock
-
-# Score scaling factors (match Excel formulas exactly)
-ST_SCALE_POS  = 5.0    # ROC20 / ST_SCALE_POS when positive  → cap at 3
-ST_SCALE_NEG  = 10.0   # ROC20 / ST_SCALE_NEG when negative  → floor at -1
-MT_SCALE_POS  = 10.0   # ROC50 / MT_SCALE_POS when positive  → cap at 3
-MT_SCALE_NEG  = 20.0   # ROC50 / MT_SCALE_NEG when negative  → floor at -1
-ST_CAP        = 3.0
-ST_FLOOR      = -1.0
-MT_CAP        = 3.0
-MT_FLOOR      = -1.0
-TREND_BULL    = 2.0     # Trend score when price > 50MA and bullish
-TREND_BEAR    = -2.0    # Trend score when very bearish
-ACCEL_BULL    = 3.0     # Acceleration threshold for STRONG quality (lowered from 5.0 → more entries)
-ACCEL_BEAR    = -5.0    # Acceleration floor for LONG signal
+MOMENTUM_LOOKBACK_DAYS      = 252   # ~12 months of trading days
+SKIP_RECENT_DAYS            = 21    # Skip last month (avoids short-term reversal)
+ABSOLUTE_MOMENTUM_THRESHOLD = 0.06  # Nifty 50 12M-1M return must exceed 6% → risk-on
+TOP_N_HOLD                  = 15    # Maximum simultaneous open positions
+HOLD_BUFFER                 = 20    # Keep holding if still in top HOLD_BUFFER (reduces churn)
+MIN_HISTORY_BARS            = 285   # Minimum bars needed: 252 + 21 + 12 buffer
 
 # ---------------------------------------------------------------------------
-# Entry Filter  — STRONG only: eliminates noisy MODERATE entries that
-# drive excessive turnover and transaction cost drag
+# Risk valve  (safety net — not part of original Dual Momentum)
+# Protects against individual stock gap-downs between monthly rebalances.
+# Applied on the monthly rebalance date only. Set to None to disable.
 # ---------------------------------------------------------------------------
-ENTRY_QUALITY_FILTER   = ("STRONG",)      # Change 1: was ("STRONG", "MODERATE")
+HARD_STOP_PCT = 0.15    # Sell if position down >15% from entry
 
 # ---------------------------------------------------------------------------
-# Signal-Driven Exit Criteria  (checked daily, not on a calendar)
+# Portfolio / Position Sizing
 # ---------------------------------------------------------------------------
-# 1. Hard stop  — position down this % from entry price → cut loss immediately
-HARD_STOP_PCT          = 0.06   # Change 2: widened from 3% → 6% (room to breathe)
-
-# 2. Profit target — harvest gains when position up this % from entry
-PROFIT_TARGET_PCT      = 0.18   # 18% (unchanged)
-
-# 3. Momentum fade — composite drops below this floor → sell
-EXIT_COMPOSITE_FLOOR   = 1.5    # normal (bull) regime floor
-
-# 4. Bear regime floor — when market is in downtrend, exit faster
-BEAR_COMPOSITE_FLOOR   = 2.5    # Change 5: stricter floor during bear market
-
-# 5. Trend break — ROC20 < TREND_BREAK_ROC20 AND price < 50D MA by TREND_BREAK_MA_PCT
-#    Tightened so minor dips don't trigger exits — requires a meaningful break
-TREND_BREAK_ROC20   = -3.0   # ROC20 must be worse than -3% (not just any negative)
-TREND_BREAK_MA_PCT  = -3.0   # Price must be >3% below 50D MA (not just any dip)
+PORTFOLIO_SIZE    = TOP_N_HOLD
+POSITION_SIZE_INR = 100_000    # ₹1 lakh per stock (15 slots = ₹15 lakh)
 
 # ---------------------------------------------------------------------------
-# Hold & Re-entry Controls  (reduce churn)
+# Market regime (uses REGIME_TICKER for absolute momentum check)
 # ---------------------------------------------------------------------------
-# Change 3: minimum days to hold before soft exits (TREND_BREAK, MOMENTUM_FADE)
-# are evaluated. Hard stop is ALWAYS active from day 1.
-MIN_HOLD_DAYS          = 7
-
-# Change 4: days after exiting a stock before it can be re-entered
-REENTRY_COOLDOWN_DAYS  = 15
+MARKET_REGIME_FILTER = True
+REGIME_TICKER        = "^NSEI"
 
 # ---------------------------------------------------------------------------
-# Market regime filter: don't open new positions if Nifty 50 is below MA
-# Using 100D MA (faster than 200D) so we re-engage sooner after corrections
+# File paths  (committed to repo after every rebalance)
 # ---------------------------------------------------------------------------
-MARKET_REGIME_FILTER   = True
-REGIME_TICKER          = "^NSEI"
-REGIME_MA_PERIOD       = 100   # Days for regime MA (100D re-engages ~6 weeks faster than 200D)
+POSITIONS_FILE = "positions.csv"
+TRADE_LOG_FILE = "trade_log.csv"
 
 # ---------------------------------------------------------------------------
-# File paths
+# Order settings — NORMAL = CNC Delivery in Zerodha via stocksdeveloper
 # ---------------------------------------------------------------------------
-COOLDOWN_FILE          = "cooldown.csv"   # tracks recent exits for re-entry gate
-
-# ---------------------------------------------------------------------------
-# Position Sizing
-# ---------------------------------------------------------------------------
-POSITION_SIZE_INR = 100_000    # Rs 1 lakh per stock (15 stocks = Rs 15 lakh)
-
-# ---------------------------------------------------------------------------
-# Timing  (all IST)
-# ---------------------------------------------------------------------------
-ORDER_TIME    = "15:00"        # Target order fire time (market closes 15:30)
+EXCHANGE     = "NSE"
+PRODUCT_TYPE = "NORMAL"    # CNC delivery (NOT INTRADAY)
+ORDER_TYPE   = "MARKET"
+VARIETY      = "REGULAR"
+ORDER_TIME   = "15:00"     # Target: fire orders before 15:30 market close
 
 # ---------------------------------------------------------------------------
 # Stocksdeveloper Webhook  (same endpoint as intraday bot)
@@ -155,17 +123,3 @@ if not STOCKSDEVELOPER_API_KEY:
         "STOCKSDEVELOPER_API_KEY is not set. "
         "Add it to your .env file or GitHub Actions secrets."
     )
-
-# ---------------------------------------------------------------------------
-# Order Defaults — NORMAL = CNC Delivery in Zerodha via stocksdeveloper
-# ---------------------------------------------------------------------------
-EXCHANGE     = "NSE"
-PRODUCT_TYPE = "NORMAL"     # CNC delivery (NOT INTRADAY)
-ORDER_TYPE   = "MARKET"
-VARIETY      = "REGULAR"
-
-# ---------------------------------------------------------------------------
-# File paths (committed back to repo after each rebalance)
-# ---------------------------------------------------------------------------
-POSITIONS_FILE = "positions.csv"     # Current open delivery positions
-TRADE_LOG_FILE = "trade_log.csv"     # Full history of all buy/sell trades
