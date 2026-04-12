@@ -108,7 +108,7 @@ TRADE_LOG_FILE = "trade_log.csv"
 # Order settings — NORMAL = CNC Delivery in Zerodha via stocksdeveloper
 # ---------------------------------------------------------------------------
 EXCHANGE     = "NSE"
-PRODUCT_TYPE = "NORMAL"    # CNC delivery (NOT INTRADAY)
+PRODUCT_TYPE = "DELIVERY"  # CNC delivery — stocksdeveloper productType for Zerodha CNC
 ORDER_TYPE   = "MARKET"
 VARIETY      = "REGULAR"
 ORDER_TIME   = "15:00"     # Target: fire orders before 15:30 market close

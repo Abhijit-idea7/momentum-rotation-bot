@@ -4,7 +4,7 @@ order_manager.py
 Sends CNC delivery order webhooks to stocksdeveloper.in.
 
 Identical webhook format to the intraday bot, but with:
-  productType: "NORMAL"   →  Zerodha CNC (Cash and Carry / Delivery)
+  productType: "DELIVERY"   →  Zerodha CNC (Cash and Carry / Delivery)
 
 Payload format:
 {
@@ -15,7 +15,7 @@ Payload format:
         "symbol":      "TATAMOTORS",
         "tradeType":   "BUY" | "SELL",
         "orderType":   "MARKET",
-        "productType": "NORMAL",
+        "productType": "DELIVERY",
         "quantity":    50
     }]
 }
@@ -51,7 +51,7 @@ def _build_payload(symbol: str, trade_type: str, quantity: int) -> dict:
                 "symbol":      symbol,
                 "tradeType":   trade_type,
                 "orderType":   ORDER_TYPE,
-                "productType": PRODUCT_TYPE,   # "NORMAL" = CNC delivery
+                "productType": PRODUCT_TYPE,   # "DELIVERY" = CNC delivery
                 "quantity":    quantity,
             }
         ],
