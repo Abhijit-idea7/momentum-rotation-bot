@@ -39,9 +39,9 @@ on:
         required: false
         default: "21"
       abs_threshold:
-        description: "Absolute momentum threshold e.g. 0.06 = 6% (default 0.06)"
+        description: "Absolute momentum threshold e.g. -0.05 = -5% (default -0.05)"
         required: false
-        default: "0.06"
+        default: "-0.05"
       hold_buffer:
         description: "Sell if rank drops below this number (default 20)"
         required: false
