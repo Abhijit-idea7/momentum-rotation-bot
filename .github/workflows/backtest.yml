@@ -56,6 +56,18 @@ on:
         description: "Disable regime filter? true/false (default false)"
         required: false
         default: "false"
+      regime_ma:
+        description: "Regime MA period in days (default 100)"
+        required: false
+        default: "100"
+      trend_roc:
+        description: "TREND_BREAK ROC20 threshold % e.g. -3.0 (default -3.0)"
+        required: false
+        default: "-3.0"
+      trend_ma:
+        description: "TREND_BREAK vs-50MA threshold % e.g. -3.0 (default -3.0)"
+        required: false
+        default: "-3.0"
 
 jobs:
   backtest:
@@ -95,6 +107,9 @@ jobs:
             --bear-floor     "${{ github.event.inputs.bear_floor      || '2.5' }}" \
             --min-hold       "${{ github.event.inputs.min_hold_days   || '7'   }}" \
             --cooldown       "${{ github.event.inputs.cooldown_days   || '15'  }}" \
+            --regime-ma      "${{ github.event.inputs.regime_ma   || '100'  }}" \
+            --trend-roc      "${{ github.event.inputs.trend_roc   || '-3.0' }}" \
+            --trend-ma       "${{ github.event.inputs.trend_ma    || '-3.0' }}" \
             ${{ github.event.inputs.no_regime_filter == 'true' && '--no-regime-filter' || '' }}
 
       - name: Upload backtest results
