@@ -5,15 +5,23 @@ name: Dual Momentum — Backtest
 # Rebalances on the last trading day of each month:
 #   1. Absolute momentum check (Nifty 50 12M-1M vs threshold)
 #   2. Relative momentum ranking (12M-1M return, skip last month)
-#   3. Sell holdings outside top hold_buffer; buy top portfolio_size
+#   3. Sell holdings outside hold_buffer; buy top portfolio_size
 #
 # NAV is marked-to-market every day for accurate Sharpe/drawdown.
-# Results upload as 3 CSV artifacts.
+# Results upload as 3 CSV artifacts (named with universe suffix).
+#
+# Universe:
+#   NIFTY200 — default. top 15 of 200 Nifty stocks.
+#   BEES     — top 5 BEES ETFs. Portfolio size/hold buffer auto-set.
 # -----------------------------------------------------------------------
 
 on:
   workflow_dispatch:
     inputs:
+      universe:
+        description: "Universe: NIFTY200 or BEES (default NIFTY200)"
+        required: false
+        default: "NIFTY200"
       start_date:
         description: "Start date (YYYY-MM-DD)"
         required: false
@@ -23,9 +31,9 @@ on:
         required: false
         default: "2024-12-31"
       portfolio_size:
-        description: "Max open positions (default 15)"
+        description: "Max open positions (leave blank to use universe default: 15 for NIFTY200, 5 for BEES)"
         required: false
-        default: "15"
+        default: ""
       capital:
         description: "Initial capital INR (default 1500000)"
         required: false
@@ -43,9 +51,9 @@ on:
         required: false
         default: "-0.05"
       hold_buffer:
-        description: "Sell if rank drops below this number (default 20)"
+        description: "Sell if rank drops below this number (leave blank to use universe default: 20 for NIFTY200, 7 for BEES)"
         required: false
-        default: "20"
+        default: ""
       hard_stop:
         description: "Hard stop fraction e.g. 0.15 = 15% (default 0.15)"
         required: false
@@ -61,7 +69,7 @@ on:
 
 jobs:
   backtest:
-    name: Run Monthly Backtest
+    name: Run Monthly Backtest (${{ github.event.inputs.universe || 'NIFTY200' }})
     runs-on: ubuntu-latest
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -87,15 +95,16 @@ jobs:
           STOCKSDEVELOPER_ACCOUNT: "backtest-mode"
         run: |
           python backtest.py \
+            --universe       "${{ github.event.inputs.universe      || 'NIFTY200' }}" \
             --start          "${{ github.event.inputs.start_date    || '2018-01-01' }}" \
             --end            "${{ github.event.inputs.end_date      || '2024-12-31' }}" \
-            --portfolio-size "${{ github.event.inputs.portfolio_size || '15' }}" \
             --capital        "${{ github.event.inputs.capital        || '1500000' }}" \
             --lookback       "${{ github.event.inputs.lookback       || '252' }}" \
             --skip           "${{ github.event.inputs.skip           || '21' }}" \
-            --abs-threshold  "${{ github.event.inputs.abs_threshold  || '0.06' }}" \
-            --hold-buffer    "${{ github.event.inputs.hold_buffer    || '20' }}" \
+            --abs-threshold  "${{ github.event.inputs.abs_threshold  || '-0.05' }}" \
             --hard-stop      "${{ github.event.inputs.hard_stop      || '0.15' }}" \
+            ${{ github.event.inputs.portfolio_size != '' && format('--portfolio-size {0}', github.event.inputs.portfolio_size) || '' }} \
+            ${{ github.event.inputs.hold_buffer    != '' && format('--hold-buffer {0}',    github.event.inputs.hold_buffer)    || '' }} \
             ${{ github.event.inputs.no_abs_filter  == 'true' && '--no-abs-filter'  || '' }} \
             ${{ github.event.inputs.no_weekly_stop == 'true' && '--no-weekly-stop' || '' }}
 
@@ -103,9 +112,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: backtest-${{ github.event.inputs.start_date || '2018' }}-${{ github.event.inputs.end_date || '2024' }}-run${{ github.run_id }}
+          name: backtest-${{ github.event.inputs.universe || 'NIFTY200' }}-${{ github.event.inputs.start_date || '2018' }}-${{ github.event.inputs.end_date || '2024' }}-run${{ github.run_id }}
           path: |
-            backtest_results.csv
-            backtest_trades.csv
-            backtest_performance.csv
+            backtest_results_*.csv
+            backtest_trades_*.csv
+            backtest_performance_*.csv
           if-no-files-found: warn
