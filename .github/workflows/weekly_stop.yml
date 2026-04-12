@@ -1,0 +1,73 @@
+name: Dual Momentum — Weekly Hard Stop Scan
+
+# -----------------------------------------------------------------------
+# Circuit breaker between monthly rebalances.
+#
+# Runs automatically every Friday at 3:00 PM IST (09:30 UTC).
+# Can also be triggered manually any time via workflow_dispatch.
+#
+# ONLY purpose: check if any held position is down > 15% from its
+# entry price. If yes, fire a CNC SELL order immediately.
+#
+# Does NOT:
+#   - Download or rank the full universe
+#   - Open new positions (entries happen at monthly rebalance only)
+#   - Exit positions for any reason other than the hard stop
+#
+# Why this matters:
+#   Without weekly scans, a stock crashing 30% in one month is only
+#   caught at month-end — locking in the full loss.
+#   With Friday scans, the stop fires within days of the breach,
+#   typically limiting the loss to 15-20%.
+#
+# After any stop fires, positions.csv and trade_log.csv are committed.
+# Empty slots are refilled at the next monthly rebalance (main.py).
+# -----------------------------------------------------------------------
+
+on:
+  workflow_dispatch:          # Manual trigger any time
+  schedule:
+    - cron: "30 9 * * 5"     # Every Friday 3:00 PM IST (09:30 UTC)
+
+jobs:
+  weekly-stop-scan:
+    name: Weekly Hard Stop Check
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run weekly hard stop scan
+        env:
+          STOCKSDEVELOPER_API_KEY: ${{ secrets.STOCKSDEVELOPER_API_KEY }}
+          STOCKSDEVELOPER_ACCOUNT: ${{ secrets.STOCKSDEVELOPER_ACCOUNT }}
+        run: python weekly_scan.py
+
+      - name: Commit portfolio changes (only if stops fired)
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add positions.csv trade_log.csv 2>/dev/null || true
+          git diff --staged --quiet && \
+            echo "No stop-outs this week — portfolio unchanged." || \
+            git commit -m "Weekly stop scan $(date -u '+%Y-%m-%d') — hard stop exit(s)" && \
+            git push
