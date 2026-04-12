@@ -6,12 +6,12 @@ Momentum Delivery Bot — Daily Signal Backtest.
 Simulates the exact same logic as main.py across historical data.
 
 Exit rules (identical to live bot):
-  1. Hard stop    — down ≥ hard_stop% from entry  [always active, day 1+]
-  2. Profit target— up  ≥ profit_target%           [always active]
-  3. Signal SHORT — direction reversed              [after min_hold_days]
-  4. Momentum fade— composite < floor               [after min_hold_days]
+  1. Hard stop    — down ≥ hard_stop% from entry              [always active, day 1+]
+  2. Profit target— up  ≥ profit_target%                       [always active]
+  3. Momentum fade— composite < floor                          [after min_hold_days]
                     floor = bear_floor in bear regime, composite_floor in bull
-  5. Trend break  — ROC20 < 0 AND price < 50D MA  [after min_hold_days]
+  4. Trend break  — ROC20 < trend_roc AND price < 50D MA by trend_ma  [after min_hold_days]
+  (SIGNAL_SHORT removed — MOMENTUM_FADE at 1.5 already covers composite-based exits)
 
 Entry rules:
   • STRONG signal only (ENTRY_QUALITY_FILTER)
@@ -51,6 +51,9 @@ from config import (
     NIFTY200_UNIVERSE,
     PROFIT_TARGET_PCT,
     REENTRY_COOLDOWN_DAYS,
+    REGIME_MA_PERIOD,
+    TREND_BREAK_MA_PCT,
+    TREND_BREAK_ROC20,
 )
 from momentum_scorer import _score_single
 
@@ -111,7 +114,9 @@ def score_bar(prices_df: pd.DataFrame, bar_idx: int) -> pd.DataFrame:
     return df
 
 
-def regime_bull(bench: pd.Series, bar_idx: int, ma_period: int = 200) -> bool:
+def regime_bull(bench: pd.Series, bar_idx: int, ma_period: int = None) -> bool:
+    if ma_period is None:
+        ma_period = REGIME_MA_PERIOD
     if bench is None or bar_idx < ma_period:
         return True
     window = bench.iloc[max(0, bar_idx - ma_period): bar_idx + 1].dropna()
@@ -132,7 +137,14 @@ def eval_exit(
     composite_floor: float,
     bear_floor:      float,
     min_hold_days:   int,
+    trend_roc:       float = None,
+    trend_ma:        float = None,
 ) -> str | None:
+    if trend_roc is None:
+        trend_roc = TREND_BREAK_ROC20
+    if trend_ma is None:
+        trend_ma = TREND_BREAK_MA_PCT
+
     if score_row is None:
         return "DATA_GAP"
 
@@ -150,14 +162,11 @@ def eval_exit(
     if days_held < min_hold_days:
         return None
 
-    if score_row["signal"] == "SHORT":
-        return "SIGNAL_SHORT"
-
     floor = composite_floor if is_bull else bear_floor
     if score_row["composite"] < floor:
         return "MOMENTUM_FADE"
 
-    if score_row["roc20"] < 0 and score_row["vs_ma50"] < 0:
+    if score_row["roc20"] < trend_roc and score_row["vs_ma50"] < trend_ma:
         return "TREND_BREAK"
 
     return None
@@ -177,7 +186,16 @@ def run_backtest(
     min_hold_days:   int,
     cooldown_days:   int,
     use_regime:      bool,
+    regime_ma:       int   = None,
+    trend_roc:       float = None,
+    trend_ma:        float = None,
 ) -> dict:
+    if regime_ma is None:
+        regime_ma = REGIME_MA_PERIOD
+    if trend_roc is None:
+        trend_roc = TREND_BREAK_ROC20
+    if trend_ma is None:
+        trend_ma = TREND_BREAK_MA_PCT
     cash      = initial_capital
     holdings  = {}   # symbol → {shares, entry_price, entry_date (Timestamp)}
     cooldowns = {}   # symbol → exit_date (Timestamp)
@@ -210,7 +228,7 @@ def run_backtest(
         bench_idx = (bench.index.get_loc(date)
                      if (bench is not None and date in bench.index)
                      else bar_idx)
-        is_bull = regime_bull(bench, bench_idx) if use_regime else True
+        is_bull = regime_bull(bench, bench_idx, regime_ma) if use_regime else True
 
         # ── Exits ─────────────────────────────────────────────────────────────
         to_sell = []
@@ -232,6 +250,8 @@ def run_backtest(
                 composite_floor = composite_floor,
                 bear_floor      = bear_floor,
                 min_hold_days   = min_hold_days,
+                trend_roc       = trend_roc,
+                trend_ma        = trend_ma,
             )
             if rsn:
                 to_sell.append((sym, rsn))
@@ -398,6 +418,12 @@ def parse_args():
     p.add_argument("--min-hold",       default=MIN_HOLD_DAYS,        type=int)
     p.add_argument("--cooldown",       default=REENTRY_COOLDOWN_DAYS,type=int)
     p.add_argument("--no-regime-filter", action="store_true")
+    p.add_argument("--regime-ma",   default=REGIME_MA_PERIOD,  type=int,
+                   help="Regime MA period in days (default %(default)s)")
+    p.add_argument("--trend-roc",   default=TREND_BREAK_ROC20, type=float,
+                   help="ROC20 threshold for TREND_BREAK exit (default %(default)s%%)")
+    p.add_argument("--trend-ma",    default=TREND_BREAK_MA_PCT, type=float,
+                   help="Price vs 50D MA threshold for TREND_BREAK exit (default %(default)s%%)")
     return p.parse_args()
 
 
@@ -415,7 +441,8 @@ def main():
     print(f"  Hard stop       : {args.stop:.0%}  |  Profit target : {args.target:.0%}")
     print(f"  Composite floor : {args.floor} (bull)  /  {args.bear_floor} (bear)")
     print(f"  Min hold days   : {args.min_hold}  |  Cooldown : {args.cooldown} days")
-    print(f"  Regime filter   : {'ON (Nifty 200D MA)' if use_regime else 'OFF'}")
+    print(f"  Regime filter   : {'ON (Nifty ' + str(args.regime_ma) + 'D MA)' if use_regime else 'OFF'}")
+    print(f"  Trend break     : ROC20 < {args.trend_roc}%  AND  vs_MA50 < {args.trend_ma}%")
     print(f"  Transaction cost: {TRANSACTION_COST*100:.2f}% per trade")
     print(f"  Initial capital : ₹{args.capital:,.0f}")
     print(sep)
@@ -438,6 +465,9 @@ def main():
         min_hold_days   = args.min_hold,
         cooldown_days   = args.cooldown,
         use_regime      = use_regime,
+        regime_ma       = args.regime_ma,
+        trend_roc       = args.trend_roc,
+        trend_ma        = args.trend_ma,
     )
     nav    = result["nav"]
     trades = result["trades"]

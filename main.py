@@ -5,12 +5,12 @@ Momentum Delivery Bot — Daily Signal Scan.
 Run manually at ~3 PM IST each trading day via GitHub Actions.
 
 Exit rules (signal-driven, evaluated in this order):
-  1. Hard stop    — down ≥ 6% from entry          [always active, even day 1]
-  2. Profit target— up  ≥ 18% from entry          [always active]
-  3. Signal SHORT — direction reversed             [after MIN_HOLD_DAYS]
-  4. Momentum fade— composite < floor              [after MIN_HOLD_DAYS]
+  1. Hard stop    — down ≥ 6% from entry              [always active, even day 1]
+  2. Profit target— up  ≥ 18% from entry              [always active]
+  3. Momentum fade— composite < floor                 [after MIN_HOLD_DAYS]
                     floor = 2.5 in bear regime, 1.5 in bull
-  5. Trend break  — ROC20 < 0 AND price < 50D MA  [after MIN_HOLD_DAYS]
+  4. Trend break  — ROC20 < -3% AND price < 50D MA by >3%  [after MIN_HOLD_DAYS]
+  (SIGNAL_SHORT removed — MOMENTUM_FADE at 1.5 covers composite-based exits cleanly)
 
 Entry rules:
   • STRONG signal only (no MODERATE)
@@ -35,6 +35,8 @@ from config import (
     PORTFOLIO_SIZE,
     POSITION_SIZE_INR,
     PROFIT_TARGET_PCT,
+    TREND_BREAK_MA_PCT,
+    TREND_BREAK_ROC20,
 )
 from data_feed import fetch_universe_prices, get_regime_signal
 from momentum_scorer import MomentumScore, print_ranked_table, rank_universe
@@ -89,15 +91,12 @@ def check_exit_reason(
     if days_held < MIN_HOLD_DAYS:
         return None   # too early to judge trend/momentum signals
 
-    if score.signal == "SHORT":
-        return "SIGNAL_SHORT"
-
     # Bear regime uses a tighter composite floor (exit faster when macro weak)
     floor = EXIT_COMPOSITE_FLOOR if bull_regime else BEAR_COMPOSITE_FLOOR
     if score.composite < floor:
         return f"MOMENTUM_FADE(composite={score.composite:.2f},floor={floor})"
 
-    if score.roc20 < 0 and score.price_vs_ma50 < 0:
+    if score.roc20 < TREND_BREAK_ROC20 and score.price_vs_ma50 < TREND_BREAK_MA_PCT:
         return f"TREND_BREAK(roc20={score.roc20:.1f}%,vs_ma={score.price_vs_ma50:.1f}%)"
 
     return None

@@ -81,7 +81,7 @@ MT_CAP        = 3.0
 MT_FLOOR      = -1.0
 TREND_BULL    = 2.0     # Trend score when price > 50MA and bullish
 TREND_BEAR    = -2.0    # Trend score when very bearish
-ACCEL_BULL    = 5.0     # Acceleration threshold for STRONG quality
+ACCEL_BULL    = 3.0     # Acceleration threshold for STRONG quality (lowered from 5.0 → more entries)
 ACCEL_BEAR    = -5.0    # Acceleration floor for LONG signal
 
 # ---------------------------------------------------------------------------
@@ -105,8 +105,10 @@ EXIT_COMPOSITE_FLOOR   = 1.5    # normal (bull) regime floor
 # 4. Bear regime floor — when market is in downtrend, exit faster
 BEAR_COMPOSITE_FLOOR   = 2.5    # Change 5: stricter floor during bear market
 
-# 5. Trend break — ROC20 < 0 AND price < 50D MA (both required)
-#    (no config needed — conditions are in code)
+# 5. Trend break — ROC20 < TREND_BREAK_ROC20 AND price < 50D MA by TREND_BREAK_MA_PCT
+#    Tightened so minor dips don't trigger exits — requires a meaningful break
+TREND_BREAK_ROC20   = -3.0   # ROC20 must be worse than -3% (not just any negative)
+TREND_BREAK_MA_PCT  = -3.0   # Price must be >3% below 50D MA (not just any dip)
 
 # ---------------------------------------------------------------------------
 # Hold & Re-entry Controls  (reduce churn)
@@ -119,10 +121,12 @@ MIN_HOLD_DAYS          = 7
 REENTRY_COOLDOWN_DAYS  = 15
 
 # ---------------------------------------------------------------------------
-# Market regime filter: don't open new positions if Nifty 50 is below 200D MA
+# Market regime filter: don't open new positions if Nifty 50 is below MA
+# Using 100D MA (faster than 200D) so we re-engage sooner after corrections
 # ---------------------------------------------------------------------------
 MARKET_REGIME_FILTER   = True
 REGIME_TICKER          = "^NSEI"
+REGIME_MA_PERIOD       = 100   # Days for regime MA (100D re-engages ~6 weeks faster than 200D)
 
 # ---------------------------------------------------------------------------
 # File paths

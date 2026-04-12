@@ -11,7 +11,7 @@ import time
 import pandas as pd
 import yfinance as yf
 
-from config import MIN_HISTORY_BARS, NIFTY200_UNIVERSE, REGIME_TICKER
+from config import MIN_HISTORY_BARS, NIFTY200_UNIVERSE, REGIME_MA_PERIOD, REGIME_TICKER
 
 logger = logging.getLogger(__name__)
 
@@ -111,21 +111,25 @@ def get_current_price(symbol: str) -> float | None:
         return None
 
 
-def get_regime_signal(lookback: int = 200) -> bool:
+def get_regime_signal(lookback: int = None) -> bool:
     """
-    Returns True (bull regime) if Nifty 50 is above its 200-day MA.
+    Returns True (bull regime) if Nifty 50 is above its regime MA.
     Returns False (bear regime) → new buys are blocked.
+    lookback defaults to REGIME_MA_PERIOD from config (100D).
     """
+    if lookback is None:
+        lookback = REGIME_MA_PERIOD
     try:
-        df = yf.Ticker(REGIME_TICKER).history(period="1y", interval="1d", auto_adjust=True)
+        period = "2y" if lookback > 200 else "1y"
+        df = yf.Ticker(REGIME_TICKER).history(period=period, interval="1d", auto_adjust=True)
         if len(df) < lookback:
             logger.warning("Insufficient regime data — defaulting to bull.")
             return True
-        ma200 = df["Close"].iloc[-lookback:].mean()
+        ma = df["Close"].iloc[-lookback:].mean()
         current = float(df["Close"].iloc[-1])
-        is_bull = current > ma200
+        is_bull = current > ma
         logger.info(
-            f"Market regime: Nifty={current:.0f}  200D-MA={ma200:.0f}  "
+            f"Market regime: Nifty={current:.0f}  {lookback}D-MA={ma:.0f}  "
             f"→ {'BULL ✓' if is_bull else 'BEAR — new buys blocked'}"
         )
         return is_bull
