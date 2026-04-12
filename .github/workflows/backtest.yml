@@ -1,11 +1,13 @@
-name: Momentum Delivery — Backtest
+name: Dual Momentum — Backtest
 
 # -----------------------------------------------------------------------
-# Daily-signal backtest — mirrors the exact live bot logic.
-# Each historical day is scanned: exits are checked first, then entries.
-# No calendar forcing — all exits are signal-driven.
+# Monthly dual momentum backtest — mirrors the exact live bot logic.
+# Rebalances on the last trading day of each month:
+#   1. Absolute momentum check (Nifty 50 12M-1M vs threshold)
+#   2. Relative momentum ranking (12M-1M return, skip last month)
+#   3. Sell holdings outside top hold_buffer; buy top portfolio_size
 #
-# Configurable parameters let you tune and compare strategies.
+# NAV is marked-to-market every day for accurate Sharpe/drawdown.
 # Results upload as 3 CSV artifacts.
 # -----------------------------------------------------------------------
 
@@ -15,7 +17,7 @@ on:
       start_date:
         description: "Start date (YYYY-MM-DD)"
         required: false
-        default: "2020-01-01"
+        default: "2018-01-01"
       end_date:
         description: "End date (YYYY-MM-DD)"
         required: false
@@ -28,50 +30,34 @@ on:
         description: "Initial capital INR (default 1500000)"
         required: false
         default: "1500000"
+      lookback:
+        description: "Momentum lookback trading days (default 252 = ~12 months)"
+        required: false
+        default: "252"
+      skip:
+        description: "Skip-month days to avoid reversal (default 21 = ~1 month)"
+        required: false
+        default: "21"
+      abs_threshold:
+        description: "Absolute momentum threshold e.g. 0.06 = 6% (default 0.06)"
+        required: false
+        default: "0.06"
+      hold_buffer:
+        description: "Sell if rank drops below this number (default 20)"
+        required: false
+        default: "20"
       hard_stop:
-        description: "Hard stop % e.g. 0.08 = 8% (default 0.08)"
+        description: "Hard stop fraction e.g. 0.15 = 15% (default 0.15)"
         required: false
-        default: "0.08"
-      profit_target:
-        description: "Profit target % e.g. 0.18 = 18% (default 0.18)"
-        required: false
-        default: "0.18"
-      composite_floor:
-        description: "Composite exit floor (default 1.5)"
-        required: false
-        default: "1.5"
-      bear_floor:
-        description: "Composite floor in bear regime (default 2.5)"
-        required: false
-        default: "2.5"
-      min_hold_days:
-        description: "Minimum hold days before soft exits apply (default 7)"
-        required: false
-        default: "7"
-      cooldown_days:
-        description: "Re-entry cooldown days after exit (default 15)"
-        required: false
-        default: "15"
-      no_regime_filter:
-        description: "Disable regime filter? true/false (default false)"
+        default: "0.15"
+      no_abs_filter:
+        description: "Disable absolute momentum? true = pure relative (default false)"
         required: false
         default: "false"
-      regime_ma:
-        description: "Regime MA period in days (default 100)"
-        required: false
-        default: "100"
-      trend_roc:
-        description: "TREND_BREAK ROC20 threshold % e.g. -3.0 (default -3.0)"
-        required: false
-        default: "-3.0"
-      trend_ma:
-        description: "TREND_BREAK vs-50MA threshold % e.g. -3.0 (default -3.0)"
-        required: false
-        default: "-3.0"
 
 jobs:
   backtest:
-    name: Run Daily Backtest
+    name: Run Monthly Backtest
     runs-on: ubuntu-latest
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -97,26 +83,22 @@ jobs:
           STOCKSDEVELOPER_ACCOUNT: "backtest-mode"
         run: |
           python backtest.py \
-            --start          "${{ github.event.inputs.start_date   || '2020-01-01' }}" \
-            --end            "${{ github.event.inputs.end_date     || '2024-12-31' }}" \
+            --start          "${{ github.event.inputs.start_date    || '2018-01-01' }}" \
+            --end            "${{ github.event.inputs.end_date      || '2024-12-31' }}" \
             --portfolio-size "${{ github.event.inputs.portfolio_size || '15' }}" \
-            --capital        "${{ github.event.inputs.capital       || '1500000' }}" \
-            --stop           "${{ github.event.inputs.hard_stop     || '0.08' }}" \
-            --target         "${{ github.event.inputs.profit_target || '0.18' }}" \
-            --floor          "${{ github.event.inputs.composite_floor || '1.5' }}" \
-            --bear-floor     "${{ github.event.inputs.bear_floor      || '2.5' }}" \
-            --min-hold       "${{ github.event.inputs.min_hold_days   || '7'   }}" \
-            --cooldown       "${{ github.event.inputs.cooldown_days   || '15'  }}" \
-            --regime-ma      "${{ github.event.inputs.regime_ma   || '100'  }}" \
-            --trend-roc      "${{ github.event.inputs.trend_roc   || '-3.0' }}" \
-            --trend-ma       "${{ github.event.inputs.trend_ma    || '-3.0' }}" \
-            ${{ github.event.inputs.no_regime_filter == 'true' && '--no-regime-filter' || '' }}
+            --capital        "${{ github.event.inputs.capital        || '1500000' }}" \
+            --lookback       "${{ github.event.inputs.lookback       || '252' }}" \
+            --skip           "${{ github.event.inputs.skip           || '21' }}" \
+            --abs-threshold  "${{ github.event.inputs.abs_threshold  || '0.06' }}" \
+            --hold-buffer    "${{ github.event.inputs.hold_buffer    || '20' }}" \
+            --hard-stop      "${{ github.event.inputs.hard_stop      || '0.15' }}" \
+            ${{ github.event.inputs.no_abs_filter == 'true' && '--no-abs-filter' || '' }}
 
       - name: Upload backtest results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: backtest-${{ github.event.inputs.start_date || '2020' }}-${{ github.event.inputs.end_date || '2024' }}-run${{ github.run_id }}
+          name: backtest-${{ github.event.inputs.start_date || '2018' }}-${{ github.event.inputs.end_date || '2024' }}-run${{ github.run_id }}
           path: |
             backtest_results.csv
             backtest_trades.csv

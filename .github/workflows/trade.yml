@@ -1,30 +1,29 @@
-name: Momentum Delivery — Daily Signal Scan
+name: Dual Momentum — Monthly Rebalance
 
 # -----------------------------------------------------------------------
-# Run MANUALLY at ~3 PM IST on any trading day you want to scan.
-# GitHub Actions UI: Actions → "Momentum Delivery — Daily Signal Scan" → Run workflow
+# Run MANUALLY on the LAST TRADING DAY of each month, ~3 PM IST.
+# GitHub Actions UI: Actions → "Dual Momentum — Monthly Rebalance" → Run workflow
 #
 # What it does:
-#   1. Scores all Nifty 200 stocks via the momentum composite framework
-#   2. Checks every held position against signal-driven exit criteria:
-#        • Composite  < 1.5          (momentum fading)
-#        • Signal     = SHORT        (direction reversal)
-#        • ROC20 < 0 AND price < 50D MA  (trend break)
-#        • Position down ≥ 8%        (hard stop-loss)
-#        • Position up   ≥ 18%       (profit harvest)
-#   3. Buys new STRONG/MODERATE LONG signals up to 15 open slots
-#   4. Fires CNC delivery market orders via stocksdeveloper → Zerodha
-#   5. Commits updated positions.csv and trade_log.csv to the repo
+#   1. Downloads 3 years of price history for all Nifty 200 stocks
+#   2. Checks absolute momentum: Is Nifty 50's 12M-1M return > 6%?
+#      -> NO:  Sells ALL positions (move to cash until next month)
+#      -> YES: Ranks stocks by 12M-1M return (Dual Momentum)
+#   3. Sells holdings that have dropped below rank 20
+#   4. Also sells any position down >15% from entry (hard stop)
+#   5. Buys top 15 ranked stocks not already held (fills open slots)
+#   6. Fires CNC delivery market orders via stocksdeveloper -> Zerodha
+#   7. Commits updated positions.csv and trade_log.csv to the repo
 #
-# No schedule — fully manual. Run when you choose to scan.
+# No schedule — fully manual. Run on the last trading day of each month.
 # -----------------------------------------------------------------------
 
 on:
   workflow_dispatch:
 
 jobs:
-  daily-scan:
-    name: Daily Signal Scan & Trade
+  monthly-rebalance:
+    name: Monthly Rebalance & Trade
     runs-on: ubuntu-latest
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -46,7 +45,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run daily scan
+      - name: Run monthly rebalance
         env:
           STOCKSDEVELOPER_API_KEY: ${{ secrets.STOCKSDEVELOPER_API_KEY }}
           STOCKSDEVELOPER_ACCOUNT: ${{ secrets.STOCKSDEVELOPER_ACCOUNT }}
@@ -59,8 +58,8 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add positions.csv trade_log.csv cooldown.csv 2>/dev/null || true
+          git add positions.csv trade_log.csv 2>/dev/null || true
           git diff --staged --quiet && \
             echo "No portfolio changes to commit." || \
-            git commit -m "Daily scan $(date -u '+%Y-%m-%d') — momentum delivery" && \
+            git commit -m "Monthly rebalance $(date -u '+%Y-%m-%d') — dual momentum" && \
             git push
