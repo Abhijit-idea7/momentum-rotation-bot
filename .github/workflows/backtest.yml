@@ -54,6 +54,10 @@ on:
         description: "Disable absolute momentum? true = pure relative (default false)"
         required: false
         default: "false"
+      no_weekly_stop:
+        description: "Disable weekly Friday stop simulation? true = monthly-only (default false)"
+        required: false
+        default: "false"
 
 jobs:
   backtest:
@@ -92,7 +96,8 @@ jobs:
             --abs-threshold  "${{ github.event.inputs.abs_threshold  || '0.06' }}" \
             --hold-buffer    "${{ github.event.inputs.hold_buffer    || '20' }}" \
             --hard-stop      "${{ github.event.inputs.hard_stop      || '0.15' }}" \
-            ${{ github.event.inputs.no_abs_filter == 'true' && '--no-abs-filter' || '' }}
+            ${{ github.event.inputs.no_abs_filter  == 'true' && '--no-abs-filter'  || '' }} \
+            ${{ github.event.inputs.no_weekly_stop == 'true' && '--no-weekly-stop' || '' }}
 
       - name: Upload backtest results
         if: always()
