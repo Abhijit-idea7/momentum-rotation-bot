@@ -27,6 +27,7 @@ How to use:
   The workflow commits updated positions.csv + trade_log.csv if any stops fire.
 """
 
+import argparse
 import logging
 import sys
 from datetime import date, datetime
@@ -47,21 +48,37 @@ logging.basicConfig(
 logger = logging.getLogger("weekly_scan")
 IST = pytz.timezone("Asia/Kolkata")
 
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Dual Momentum — Weekly Hard Stop Scan")
+    p.add_argument(
+        "--dry-run", "-n",
+        action="store_true",
+        help="Preview stop breaches without placing any sell orders or saving state.",
+    )
+    return p.parse_args()
+
+
 # Warn on positions within this fraction of the stop (early warning system)
 # e.g. if stop is 15%, warn when position is down > 10%
 _WARN_THRESHOLD = HARD_STOP_PCT * 0.67
 
 
-def run() -> None:
+def run(dry_run: bool = False) -> None:
     now = datetime.now(IST)
     sep = "=" * 64
 
     logger.info(sep)
-    logger.info("  WEEKLY HARD STOP SCANNER")
+    if dry_run:
+        logger.info("  WEEKLY HARD STOP SCANNER — DRY RUN (no orders will be placed)")
+    else:
+        logger.info("  WEEKLY HARD STOP SCANNER")
     logger.info(f"  Scan time  : {now.strftime('%Y-%m-%d %H:%M:%S IST')}")
     logger.info(f"  Hard stop  : cut any position down > {HARD_STOP_PCT:.0%} from entry")
     logger.info(f"  Warning    : flag positions down > {_WARN_THRESHOLD:.0%} (approaching stop)")
     logger.info("  Scope      : hard stop exits ONLY — no buys, no rank exits")
+    if dry_run:
+        logger.info("  *** DRY RUN — sell orders will NOT be sent to broker ***")
     logger.info(sep)
 
     portfolio = PortfolioState()
@@ -89,24 +106,17 @@ def run() -> None:
         pnl_inr   = round((cur_price - pos.entry_price) * pos.quantity, 2)
 
         if loss_pct >= HARD_STOP_PCT:
-            # ── Hard stop breached — fire sell order ──────────────────────
+            # ── Hard stop breached ────────────────────────────────────────
             logger.warning(
                 f"  [STOP] {pos.symbol:<14}  "
                 f"entry=Rs{pos.entry_price:>8.2f}  now=Rs{cur_price:>8.2f}  "
                 f"loss={loss_pct:.1%}  P&L=Rs{pnl_inr:+,.0f}  held={days_held}d"
             )
-            ok = sell_delivery(pos.symbol, pos.quantity)
-            if ok:
-                log_sell(
-                    symbol          = pos.symbol,
-                    price           = cur_price,
-                    quantity        = pos.quantity,
-                    entry_price     = pos.entry_price,
-                    momentum_return = pos.momentum_return_at_entry,
-                    rank            = pos.rank_at_entry,
-                    reason          = f"WEEKLY_HARD_STOP({loss_pct:.1%})",
+            if dry_run:
+                logger.warning(
+                    f"  [DRY ] Would SELL {pos.symbol} x{pos.quantity} "
+                    f"@ Rs{cur_price:.2f} — order NOT sent"
                 )
-                portfolio.remove(pos.symbol)
                 stops_fired.append({
                     "symbol":      pos.symbol,
                     "entry_price": pos.entry_price,
@@ -117,10 +127,32 @@ def run() -> None:
                     "days_held":   days_held,
                 })
             else:
-                logger.error(
-                    f"  [FAIL] Sell order FAILED for {pos.symbol} — "
-                    f"position kept. Check broker and retry manually."
-                )
+                ok = sell_delivery(pos.symbol, pos.quantity)
+                if ok:
+                    log_sell(
+                        symbol          = pos.symbol,
+                        price           = cur_price,
+                        quantity        = pos.quantity,
+                        entry_price     = pos.entry_price,
+                        momentum_return = pos.momentum_return_at_entry,
+                        rank            = pos.rank_at_entry,
+                        reason          = f"WEEKLY_HARD_STOP({loss_pct:.1%})",
+                    )
+                    portfolio.remove(pos.symbol)
+                    stops_fired.append({
+                        "symbol":      pos.symbol,
+                        "entry_price": pos.entry_price,
+                        "exit_price":  cur_price,
+                        "quantity":    pos.quantity,
+                        "loss_pct":    loss_pct,
+                        "pnl_inr":     pnl_inr,
+                        "days_held":   days_held,
+                    })
+                else:
+                    logger.error(
+                        f"  [FAIL] Sell order FAILED for {pos.symbol} — "
+                        f"position kept. Check broker and retry manually."
+                    )
 
         elif loss_pct >= _WARN_THRESHOLD:
             # ── Approaching stop — flag for attention ─────────────────────
@@ -146,8 +178,8 @@ def run() -> None:
                 f"loss={loss_pct:.1%}  P&L=Rs{pnl_inr:+,.0f}  held={days_held}d"
             )
 
-    # ── Persist changes if any stops fired ───────────────────────────────────
-    if stops_fired:
+    # ── Persist changes if any stops fired (skipped in dry-run) ─────────────
+    if stops_fired and not dry_run:
         portfolio.save()
 
     # ── Summary ───────────────────────────────────────────────────────────────
@@ -179,8 +211,12 @@ def run() -> None:
     if fetch_errors:
         logger.warning(f"\n  Price fetch failures — check manually: {', '.join(fetch_errors)}")
 
+    if dry_run:
+        logger.info("\n  *** DRY RUN COMPLETE — no orders sent, no files changed ***")
+
     logger.info(sep)
 
 
 if __name__ == "__main__":
-    run()
+    args = parse_args()
+    run(dry_run=args.dry_run)

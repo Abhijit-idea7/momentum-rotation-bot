@@ -21,6 +21,7 @@ Strategy (Gary Antonacci's Dual Momentum, Nifty 200 adaptation):
     Protects against individual stock blow-ups between monthly rebalances.
 """
 
+import argparse
 import logging
 import sys
 from datetime import date, datetime
@@ -48,6 +49,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 IST = pytz.timezone("Asia/Kolkata")
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Dual Momentum — Monthly Rebalance")
+    p.add_argument(
+        "--dry-run", "-n",
+        action="store_true",
+        help="Preview all actions without placing any orders or saving state. "
+             "Safe to run any time — no orders are sent to the broker.",
+    )
+    return p.parse_args()
 
 
 def ist_now() -> datetime:
@@ -99,18 +111,23 @@ def check_exit_reason(
 # Main
 # ---------------------------------------------------------------------------
 
-def run() -> None:
+def run(dry_run: bool = False) -> None:
     now = ist_now()
 
     sep = "=" * 66
     logger.info(sep)
-    logger.info("  DUAL MOMENTUM DELIVERY BOT — MONTHLY REBALANCE")
+    if dry_run:
+        logger.info("  DUAL MOMENTUM DELIVERY BOT — DRY RUN (no orders will be placed)")
+    else:
+        logger.info("  DUAL MOMENTUM DELIVERY BOT — MONTHLY REBALANCE")
     logger.info(f"  Run time     : {now.strftime('%Y-%m-%d %H:%M:%S IST')}")
     logger.info(f"  Strategy     : Dual Momentum (Antonacci) — Nifty 200")
     logger.info(f"  Lookback     : 12M-1M (252 days, skip 21 days)")
     logger.info(f"  Portfolio    : top {TOP_N_HOLD} stocks | Rs{POSITION_SIZE_INR:,.0f}/slot")
     logger.info(f"  Hold buffer  : sell if rank > {HOLD_BUFFER}")
     logger.info(f"  Hard stop    : {HARD_STOP_PCT:.0%} from entry (monthly check)")
+    if dry_run:
+        logger.info("  *** DRY RUN — orders logged but NOT sent to broker ***")
     logger.info(sep)
 
     # ── 1. Price data ─────────────────────────────────────────────────────────
@@ -169,30 +186,49 @@ def run() -> None:
         cur_price = cur.current_price if cur else pos.entry_price
         mom_ret   = cur.momentum_return if cur else pos.momentum_return_at_entry
         cur_rank  = cur.rank if cur else 0
+        pnl_inr   = round((cur_price - pos.entry_price) * pos.quantity, 2)
+        pnl_pct   = round((cur_price - pos.entry_price) / pos.entry_price * 100, 2)
 
-        ok = sell_delivery(pos.symbol, pos.quantity)
-        if ok:
-            log_sell(
-                symbol          = pos.symbol,
-                price           = cur_price,
-                quantity        = pos.quantity,
-                entry_price     = pos.entry_price,
-                momentum_return = mom_ret,
-                rank            = cur_rank,
-                reason          = reason,
+        if dry_run:
+            logger.info(
+                f"  [DRY-SELL] {pos.symbol:<14} qty={pos.quantity}  "
+                f"entry=Rs{pos.entry_price:.2f}  now=Rs{cur_price:.2f}  "
+                f"P&L=Rs{pnl_inr:+,.0f} ({pnl_pct:+.1f}%)  reason={reason}"
             )
             session_sells.append({
                 "symbol":      pos.symbol,
                 "price":       cur_price,
                 "entry_price": pos.entry_price,
                 "quantity":    pos.quantity,
-                "pnl_inr":     round((cur_price - pos.entry_price) * pos.quantity, 2),
-                "pnl_pct":     round((cur_price - pos.entry_price) / pos.entry_price * 100, 2),
+                "pnl_inr":     pnl_inr,
+                "pnl_pct":     pnl_pct,
                 "reason":      reason,
             })
-            portfolio.remove(pos.symbol)
+            # Don't remove from portfolio in dry-run — state is unchanged
         else:
-            logger.error(f"  SELL FAILED {pos.symbol} — keeping in portfolio.")
+            ok = sell_delivery(pos.symbol, pos.quantity)
+            if ok:
+                log_sell(
+                    symbol          = pos.symbol,
+                    price           = cur_price,
+                    quantity        = pos.quantity,
+                    entry_price     = pos.entry_price,
+                    momentum_return = mom_ret,
+                    rank            = cur_rank,
+                    reason          = reason,
+                )
+                session_sells.append({
+                    "symbol":      pos.symbol,
+                    "price":       cur_price,
+                    "entry_price": pos.entry_price,
+                    "quantity":    pos.quantity,
+                    "pnl_inr":     pnl_inr,
+                    "pnl_pct":     pnl_pct,
+                    "reason":      reason,
+                })
+                portfolio.remove(pos.symbol)
+            else:
+                logger.error(f"  SELL FAILED {pos.symbol} — keeping in portfolio.")
 
     # ── ENTRIES (only if risk-on) ─────────────────────────────────────────────
     if not risk_on:
@@ -223,21 +259,12 @@ def run() -> None:
                 )
                 continue
 
-            ok = buy_delivery(r.symbol, qty)
-            if ok:
-                log_buy(
-                    symbol          = r.symbol,
-                    price           = r.current_price,
-                    quantity        = qty,
-                    momentum_return = r.momentum_return,
-                    rank            = r.rank,
-                )
-                portfolio.add(
-                    symbol                   = r.symbol,
-                    entry_price              = r.current_price,
-                    quantity                 = qty,
-                    momentum_return_at_entry = r.momentum_return,
-                    rank_at_entry            = r.rank,
+            if dry_run:
+                logger.info(
+                    f"  [DRY-BUY ] {r.symbol:<14} qty={qty}  "
+                    f"price=Rs{r.current_price:.2f}  "
+                    f"value=Rs{qty * r.current_price:,.0f}  "
+                    f"12M-1M={r.momentum_return:+.1%}  rank=#{r.rank}"
                 )
                 session_buys.append({
                     "symbol":          r.symbol,
@@ -246,22 +273,55 @@ def run() -> None:
                     "momentum_return": r.momentum_return,
                     "rank":            r.rank,
                 })
+                # Don't update portfolio or log trades in dry-run
             else:
-                logger.error(f"  BUY FAILED {r.symbol}.")
+                ok = buy_delivery(r.symbol, qty)
+                if ok:
+                    log_buy(
+                        symbol          = r.symbol,
+                        price           = r.current_price,
+                        quantity        = qty,
+                        momentum_return = r.momentum_return,
+                        rank            = r.rank,
+                    )
+                    portfolio.add(
+                        symbol                   = r.symbol,
+                        entry_price              = r.current_price,
+                        quantity                 = qty,
+                        momentum_return_at_entry = r.momentum_return,
+                        rank_at_entry            = r.rank,
+                    )
+                    session_buys.append({
+                        "symbol":          r.symbol,
+                        "price":           r.current_price,
+                        "quantity":        qty,
+                        "momentum_return": r.momentum_return,
+                        "rank":            r.rank,
+                    })
+                else:
+                    logger.error(f"  BUY FAILED {r.symbol}.")
 
-    # ── Save state ────────────────────────────────────────────────────────────
-    portfolio.save()
+    # ── Save state (skipped in dry-run) ──────────────────────────────────────
+    if dry_run:
+        logger.info("\n  *** DRY RUN — positions.csv and trade_log.csv NOT updated ***")
+    else:
+        portfolio.save()
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print_session_summary(session_buys, session_sells)
-    logger.info("\nPortfolio after rebalance:")
-    logger.info(portfolio.summary())
 
-    if not session_sells and not session_buys:
-        logger.info("\nNo trades this month — portfolio unchanged.")
-
-    logger.info("\nDone. positions.csv and trade_log.csv committed by workflow.")
+    if dry_run:
+        logger.info("\n--- DRY RUN COMPLETE ---")
+        logger.info(f"  Would have placed {len(session_buys)} BUY and {len(session_sells)} SELL order(s).")
+        logger.info("  No orders were sent. Run without --dry-run on a trading day to execute.")
+    else:
+        logger.info("\nPortfolio after rebalance:")
+        logger.info(portfolio.summary())
+        if not session_sells and not session_buys:
+            logger.info("\nNo trades this month — portfolio unchanged.")
+        logger.info("\nDone. positions.csv and trade_log.csv committed by workflow.")
 
 
 if __name__ == "__main__":
-    run()
+    args = parse_args()
+    run(dry_run=args.dry_run)
