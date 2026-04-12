@@ -466,7 +466,7 @@ def parse_args():
     p.add_argument("--skip",           default=SKIP_RECENT_DAYS,   type=int,
                    help=f"Skip-month days (default {SKIP_RECENT_DAYS})")
     p.add_argument("--abs-threshold",  default=ABSOLUTE_MOMENTUM_THRESHOLD, type=float,
-                   help=f"Absolute momentum threshold (default {ABSOLUTE_MOMENTUM_THRESHOLD})")
+                   help=f"Absolute momentum threshold, e.g. -0.05 = -5%% (default {ABSOLUTE_MOMENTUM_THRESHOLD})")
     p.add_argument("--hold-buffer",    default=HOLD_BUFFER,        type=int,
                    help=f"Sell if rank > this (default {HOLD_BUFFER})")
     p.add_argument("--hard-stop",      default=HARD_STOP_PCT,      type=float,
