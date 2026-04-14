@@ -72,7 +72,7 @@ BEES_UNIVERSE: list[str] = [
     # ── Other AMC ETFs (same strategy, different fund house) ──────────────────
     "SETFNIF50",        # SBI ETF Nifty 50
     "HDFCNIFTY",        # HDFC Nifty 50 ETF
-    "MAFANG",           # Mirae Asset NYSE FANG+ ETF  (US tech / international exposure)
+    # MAFANG removed — subscription closed, not available for new investment
 ]
 
 
