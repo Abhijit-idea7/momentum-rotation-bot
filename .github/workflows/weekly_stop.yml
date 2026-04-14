@@ -42,6 +42,8 @@ jobs:
   weekly-stop-scan:
     name: Weekly Hard Stop Check (${{ github.event.inputs.universe || 'NIFTY200' }})
     runs-on: ubuntu-latest
+    permissions:
+      contents: write     # needed to git push updated positions/trade log back to repo
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 

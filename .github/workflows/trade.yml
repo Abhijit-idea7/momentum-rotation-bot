@@ -38,6 +38,8 @@ jobs:
   monthly-rebalance:
     name: Monthly Rebalance & Trade (${{ github.event.inputs.universe || 'NIFTY200' }})
     runs-on: ubuntu-latest
+    permissions:
+      contents: write     # needed to git push portfolio state back to repo
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
